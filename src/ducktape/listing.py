@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING, Any
 
+from irods.column import Like
 from irods.models import Collection, DataObject
 
 from .errors import IrodsFileNotFoundError
@@ -179,3 +180,92 @@ def stat(session: iRODSSession, path: str) -> InfoDict:
         return dir_info(path, collection)
 
     raise IrodsFileNotFoundError(path)
+
+
+def _is_under(name: str, root: str) -> bool:
+    """True if `name` is `root` itself or a descendant path of `root`."""
+    if name == root:
+        return True
+    prefix = root if root.endswith("/") else root + "/"
+    return name.startswith(prefix)
+
+
+def _subtree_pattern(root: str) -> str:
+    """The GenQuery LIKE pattern matching every descendant collection of `root`."""
+    prefix = "" if root == ROOT else root
+    return f"{prefix}/%"
+
+
+def _dedup_by_path(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Like `dedup_replicas` but keyed on full path, for cross-collection subtree walks."""
+    by_path: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        path = _join(row["collection"], row["name"])
+        current = by_path.get(path)
+        if current is None or row["modify_time"] > current["modify_time"]:
+            by_path[path] = dict(row)
+    return list(by_path.values())
+
+
+def _subtree_data_object_rows(
+    session: iRODSSession, root: str
+) -> Iterator[dict[str, Any]]:
+    # iRODS LIKE treats `_`/`%` as wildcards, so `root + "/%"` can over-match siblings (and
+    # `_` is common in names). That is harmless here: the pattern always matches a *superset*
+    # of the real descendants, and the `_is_under` post-filter trims it to the exact set.
+    # A separate `Collection.name == root` query covers files directly in `root` (which the
+    # descendant pattern excludes).
+    filters = [Collection.name == root, Like(Collection.name, _subtree_pattern(root))]
+    for condition in filters:
+        query = session.query(
+            Collection.name,
+            DataObject.name,
+            DataObject.size,
+            DataObject.modify_time,
+            DataObject.create_time,
+        ).filter(condition)
+        for row in query.get_results():
+            collection = row[Collection.name]
+            if not _is_under(collection, root):
+                continue
+            yield {
+                "collection": collection,
+                "name": row[DataObject.name],
+                "size": row[DataObject.size],
+                "modify_time": row[DataObject.modify_time],
+                "create_time": row[DataObject.create_time],
+            }
+
+
+def walk_data_objects(session: iRODSSession, root: str) -> list[InfoDict]:
+    """Return fsspec file info dicts for every data object at or below `root`.
+
+    Uses a constant number of GenQueries (one exact, one subtree LIKE) regardless of tree
+    depth, instead of one listing per directory.
+    """
+    rows = _dedup_by_path(_subtree_data_object_rows(session, root))
+    return [file_info(row["collection"], row) for row in rows]
+
+
+def walk_collections(session: iRODSSession, root: str) -> list[InfoDict]:
+    """Return fsspec directory info dicts for every collection strictly below `root`."""
+    query = session.query(
+        Collection.name,
+        Collection.modify_time,
+        Collection.create_time,
+    ).filter(Like(Collection.name, _subtree_pattern(root)))
+    infos = []
+    for row in query.get_results():
+        name = row[Collection.name]
+        if name == root or not _is_under(name, root):
+            continue
+        infos.append(
+            dir_info(
+                name,
+                {
+                    "modify_time": row[Collection.modify_time],
+                    "create_time": row[Collection.create_time],
+                },
+            )
+        )
+    return infos

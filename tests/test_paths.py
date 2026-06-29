@@ -53,6 +53,22 @@ def test_normalize_rejects_foreign_scheme() -> None:
 
 
 @pytest.mark.parametrize(
+    "raw",
+    [
+        "/tempZone/home/rods/../secret",
+        "irods:///tempZone/home/./rods",
+        "/tempZone/..",
+        "..",
+        ".",
+    ],
+    ids=["dotdot-middle", "dot-middle", "dotdot-end", "dotdot-only", "dot-only"],
+)
+def test_normalize_rejects_dot_segments(raw: str) -> None:
+    with pytest.raises(IrodsPathError):
+        normalize_irods_path(raw)
+
+
+@pytest.mark.parametrize(
     ("raw", "expected"),
     [
         ("irods:///tempZone/home/rods/x.parquet", "/tempZone/home/rods"),

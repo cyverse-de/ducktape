@@ -41,6 +41,10 @@ class AuthConfig:
     zone: str | None = None
     password: str | None = field(default=None, repr=False)
     env_file: str | None = None
+    # Extra keyword args forwarded verbatim to iRODSSession, e.g. client_server_negotiation,
+    # client_server_policy, ssl_context, ssl_verify_server. Kept out of repr so a TLS context
+    # (or anything sensitive a caller stashes here) never lands in a log line.
+    connection_options: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
 
 def resolve_auth(
@@ -53,6 +57,7 @@ def resolve_auth(
     passed as visible options, and the env-file path falls back to
     `IRODS_ENVIRONMENT_FILE` then the iRODS default.
     """
+    connection_options = dict(storage_options.get("connection_options") or {})
     if "host" in storage_options:
         password = storage_options.get("password") or env.get("IRODS_PASSWORD")
         config = AuthConfig(
@@ -62,6 +67,7 @@ def resolve_auth(
             user=storage_options.get("user"),
             zone=storage_options.get("zone"),
             password=password,
+            connection_options=connection_options,
         )
         missing = [
             name
@@ -81,7 +87,9 @@ def resolve_auth(
         or env.get("IRODS_ENVIRONMENT_FILE")
         or DEFAULT_ENV_FILE
     )
-    return AuthConfig(mode="env_file", env_file=env_file)
+    return AuthConfig(
+        mode="env_file", env_file=env_file, connection_options=connection_options
+    )
 
 
 def _make_session(config: AuthConfig) -> iRODSSession:
@@ -94,9 +102,13 @@ def _make_session(config: AuthConfig) -> iRODSSession:
             user=config.user,
             password=config.password,
             zone=config.zone,
+            **config.connection_options,
         )
     assert config.env_file is not None
-    return iRODSSession(irods_env_file=os.path.expanduser(config.env_file))
+    return iRODSSession(
+        irods_env_file=os.path.expanduser(config.env_file),
+        **config.connection_options,
+    )
 
 
 class SessionProvider(Protocol):

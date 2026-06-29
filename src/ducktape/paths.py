@@ -49,6 +49,13 @@ def normalize_irods_path(raw: str | None) -> str:
         logger.debug("normalizing relative iRODS path %r to absolute", raw)
 
     segments = [segment for segment in path.split("/") if segment]
+    # iRODS logical paths are literal: "." and ".." are not parent/self traversal but
+    # would be treated as ordinary collection names. Reject them so a path like
+    # irods:///zone/../other can never be silently misinterpreted by the server.
+    if any(segment in (".", "..") for segment in segments):
+        raise IrodsPathError(
+            f"iRODS path may not contain '.' or '..' segments: {raw!r}"
+        )
     if not segments:
         return ROOT
     return "/" + "/".join(segments)

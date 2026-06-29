@@ -13,6 +13,7 @@ it in `_upload_chunk`, so a multi-gigabyte write never stages the whole object i
 from __future__ import annotations
 
 import logging
+import threading
 from typing import TYPE_CHECKING, Any
 
 from fsspec.spec import AbstractBufferedFile
@@ -52,25 +53,24 @@ class DucktapeBufferedFile(AbstractBufferedFile):
             **kwargs,
         )
         self._handle: Any | None = None
+        # Guards the single shared PRC handle: DuckDB issues parallel range reads against the
+        # same file object, and seek()+read() on one handle is not atomic. This serializes
+        # range reads within a single file (handles for different files stay independent).
+        self._handle_lock = threading.Lock()
 
     def _ensure_handle(self) -> Any:
         if self._handle is None:
-            with self.fs.lock:
-                self._handle = self.fs.session.data_objects.open(
-                    self.path, "r", allow_redirect=self.fs.allow_redirect
-                )
+            self._handle = self.fs._open_data_object(self.path, "r")
         return self._handle
 
     def _fetch_range(self, start: int, end: int) -> bytes:
-        handle = self._ensure_handle()
-        handle.seek(start)
-        return handle.read(end - start)
+        with self._handle_lock:
+            handle = self._ensure_handle()
+            handle.seek(start)
+            return handle.read(end - start)
 
     def _initiate_upload(self) -> None:
-        with self.fs.lock:
-            self._handle = self.fs.session.data_objects.open(
-                self.path, "w", allow_redirect=self.fs.allow_redirect
-            )
+        self._handle = self.fs._open_data_object(self.path, "w")
 
     def _upload_chunk(self, final: bool = False) -> None:
         if self._handle is None:
