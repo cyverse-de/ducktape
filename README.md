@@ -4,6 +4,11 @@ An [fsspec](https://filesystem-spec.readthedocs.io/) filesystem backend for
 [iRODS](https://irods.org/), built on
 [python-irodsclient](https://github.com/irods/python-irodsclient).
 
+> **Status: proof of concept — not production-ready.** ducktape is an early prototype
+> under active development. It has been exercised against a live iRODS deployment but has
+> not been hardened, performance-tuned, or stabilized for production use; APIs and
+> behavior may change without notice. Use it for evaluation and experimentation only.
+
 It exposes iRODS under the `irods://` protocol so tools that speak fsspec can read and
 write iRODS data objects. The primary consumers are DuckDB (via `register_filesystem`)
 and a web-based data manager. It is designed for large directory listings (10k+ entries)
