@@ -12,31 +12,80 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+import time
+from collections.abc import Generator, Iterator, Mapping
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, cast
 
 from fsspec.callbacks import DEFAULT_CALLBACK, Callback
 from fsspec.spec import AbstractFileSystem
 from irods.exception import (
     CAT_COLLECTION_NOT_EMPTY,
     CAT_NO_ROWS_FOUND,
+    HIERARCHY_ERROR,
     DataObjectDoesNotExist,
+    DoesNotExist,
+    PycommandsException,
+    iRODSException,
 )
 
 from . import listing
 from .auth import DEFAULT_PORT, SessionProvider, SingleSessionProvider, resolve_auth
-from .errors import IrodsNotEmptyError
+from .errors import IrodsFileNotFoundError, IrodsNotEmptyError, IrodsOperationError
 from .file import DucktapeBufferedFile
 from .listing import InfoDict
-from .paths import normalize_irods_path, parent_path
+from .paths import base_name, normalize_irods_path, parent_path
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from irods.session import iRODSSession
 
 logger = logging.getLogger("ducktape")
 
 DEFAULT_BLOCK_SIZE = 4 * 2**20
 DEFAULT_CACHE_TYPE = "readahead"
+# On iRODS >= 4.3.1, concurrent opens can intermittently fail with HIERARCHY_ERROR while the
+# server resolves the resource hierarchy; the operation succeeds on a quick retry. Retries are
+# on by default; set hierarchy_retries=0 to disable.
+DEFAULT_HIERARCHY_RETRIES = 3
+DEFAULT_HIERARCHY_RETRY_BACKOFF = 0.1
+
+
+@contextmanager
+def _translate_errors(path: str) -> Iterator[None]:
+    """Map raw python-irodsclient exceptions to ducktape's typed errors.
+
+    Keeps the write/copy/mkdir paths consistent with the read path so fsspec and DuckDB see
+    `FileNotFoundError` for missing objects and a single `IrodsOperationError` (an `OSError`)
+    otherwise, with the PRC cause preserved via `__cause__`.
+    """
+    try:
+        yield
+    except (DoesNotExist, CAT_NO_ROWS_FOUND) as exc:
+        raise IrodsFileNotFoundError(path) from exc
+    except CAT_COLLECTION_NOT_EMPTY as exc:
+        raise IrodsNotEmptyError(path) from exc
+    except (PycommandsException, iRODSException) as exc:
+        raise IrodsOperationError(
+            f"iRODS operation failed for {path!r}: {exc}"
+        ) from exc
+
+
+def _threadsafe_progress(callback: Callback) -> Callable[[int], None]:
+    """A byte-count updater for PRC `updatables`, safe to call from transfer threads.
+
+    PRC's parallel get/put invoke the updatable from several worker threads, and fsspec's
+    `Callback.relative_update` does a non-atomic `self.value += inc`; the lock keeps the
+    progress total from losing increments.
+    """
+    lock = threading.Lock()
+
+    def update(num_bytes: int) -> None:
+        with lock:
+            callback.relative_update(num_bytes)
+
+    return update
 
 
 class DucktapeFileSystem(AbstractFileSystem):
@@ -58,6 +107,9 @@ class DucktapeFileSystem(AbstractFileSystem):
         num_threads: int = 0,
         listing_page_size: int | None = None,
         allow_redirect: bool = False,
+        hierarchy_retries: int = DEFAULT_HIERARCHY_RETRIES,
+        hierarchy_retry_backoff: float = DEFAULT_HIERARCHY_RETRY_BACKOFF,
+        connection_options: Mapping[str, Any] | None = None,
         env: Mapping[str, str] | None = None,
         session_provider: SessionProvider | None = None,
         **kwargs: Any,
@@ -72,8 +124,10 @@ class DucktapeFileSystem(AbstractFileSystem):
         # replica's resource host per open, which races under concurrent opens
         # (HIERARCHY_ERROR) and undermines connection pooling.
         self.allow_redirect = allow_redirect
+        self.hierarchy_retries = hierarchy_retries
+        self.hierarchy_retry_backoff = hierarchy_retry_backoff
 
-        connection_options = {
+        storage_options = {
             key: value
             for key, value in {
                 "host": host,
@@ -82,11 +136,12 @@ class DucktapeFileSystem(AbstractFileSystem):
                 "password": password,
                 "zone": zone,
                 "irods_env_file": irods_env_file,
+                "connection_options": connection_options,
             }.items()
             if value is not None
         }
         self.auth = resolve_auth(
-            connection_options, env if env is not None else os.environ
+            storage_options, env if env is not None else os.environ
         )
         self._provider = session_provider or SingleSessionProvider(self.auth)
 
@@ -105,6 +160,50 @@ class DucktapeFileSystem(AbstractFileSystem):
     def lock(self) -> threading.RLock:
         """Guards connection checkout and metadata queries (not byte transfers)."""
         return self._lock
+
+    def _retry_hierarchy(
+        self,
+        operation: Callable[[], Any],
+        path: str,
+        on_retry: Callable[[], None] | None = None,
+    ) -> Any:
+        """Run `operation`, retrying transient iRODS HIERARCHY_ERRORs.
+
+        On iRODS >= 4.3.1 a concurrent open can fail while the server resolves the resource
+        hierarchy; a short retry almost always succeeds. Only HIERARCHY_ERROR is retried, and
+        only up to `hierarchy_retries` times — every other error propagates immediately.
+        `on_retry` runs before each retry (e.g. to reset a progress callback that the failed
+        attempt may have partially advanced).
+        """
+        attempt = 0
+        while True:
+            try:
+                return operation()
+            except HIERARCHY_ERROR:
+                if attempt >= self.hierarchy_retries:
+                    raise
+                attempt += 1
+                if on_retry is not None:
+                    on_retry()
+                logger.warning(
+                    "iRODS HIERARCHY_ERROR on %s; retry %d/%d. This is the iRODS >= 4.3.1 "
+                    "resource-hierarchy race under concurrent opens; a retry usually clears it.",
+                    path,
+                    attempt,
+                    self.hierarchy_retries,
+                )
+                time.sleep(self.hierarchy_retry_backoff * attempt)
+
+    def _open_data_object(self, path: str, mode: str) -> Any:
+        """Open a PRC data-object handle under the lock, retrying HIERARCHY_ERRORs."""
+
+        def opener() -> Any:
+            with self._lock:
+                return self.session.data_objects.open(
+                    path, mode, allow_redirect=self.allow_redirect
+                )
+
+        return self._retry_hierarchy(opener, path)
 
     def close(self) -> None:
         """Release the iRODS session and its connection pool."""
@@ -129,15 +228,18 @@ class DucktapeFileSystem(AbstractFileSystem):
         norm = self._strip_protocol(path)
         entries = self.dircache.get(norm)
         if entries is None:
-            details = self.info(norm)
-            if details["type"] == "file":
-                entries = [details]
-            else:
-                with self._lock:
-                    entries = listing.list_collection_children(
-                        self.session, norm, self.listing_page_size
-                    )
-            self.dircache[norm] = entries
+            with self._lock:
+                # Re-check under the lock so concurrent ls() of the same path issue one query.
+                entries = self.dircache.get(norm)
+                if entries is None:
+                    details = self.info(norm)
+                    if details["type"] == "file":
+                        entries = [details]
+                    else:
+                        entries = listing.list_collection_children(
+                            self.session, norm, self.listing_page_size
+                        )
+                    self.dircache[norm] = entries
         return entries if detail else [entry["name"] for entry in entries]
 
     def created(self, path: str):
@@ -145,6 +247,112 @@ class DucktapeFileSystem(AbstractFileSystem):
 
     def modified(self, path: str):
         return self.info(path).get("modified")
+
+    def walk(
+        self,
+        path: str,
+        maxdepth: int | None = None,
+        topdown: bool = True,
+        on_error: str = "omit",
+        **kwargs: Any,
+    ) -> Generator[Any, Any, None]:
+        """Recursively walk a subtree.
+
+        For an unbounded walk, iRODS can return the whole subtree with a single `LIKE`
+        filter on the collection path, so this fetches the tree once and yields it in the
+        standard `(path, dirs, files)` contract — `find`/`glob` (unbounded) inherit that
+        speedup. A bounded walk (`maxdepth` set) delegates to fsspec's per-directory `ls`,
+        which fetches only the requested depth instead of the entire subtree.
+        """
+        if maxdepth is not None and maxdepth < 1:
+            raise ValueError("maxdepth must be at least 1")
+        if maxdepth is not None:
+            yield from super().walk(path, maxdepth, topdown, on_error, **kwargs)
+            return
+
+        norm = self._strip_protocol(path)
+        detail = kwargs.pop("detail", False)
+        try:
+            # Acquire the lock separately per query: each GenQuery's continuation must page
+            # on a consistent pool connection (so it can't be interleaved), but releasing
+            # between queries lets concurrent opens/info proceed instead of waiting out the
+            # whole subtree scan.
+            with self._lock:
+                is_directory = listing.stat(self.session, norm)["type"] == "directory"
+            if not is_directory:
+                return  # find()'s isfile fallback handles a file path
+            with self._lock:
+                file_infos = listing.walk_data_objects(self.session, norm)
+            with self._lock:
+                dir_infos = listing.walk_collections(self.session, norm)
+        except (FileNotFoundError, OSError) as exc:
+            if on_error == "raise":
+                raise
+            if callable(on_error):
+                on_error(exc)
+            return
+
+        children_dirs: dict[str, list[InfoDict]] = {}
+        children_files: dict[str, list[InfoDict]] = {}
+        for info in file_infos:
+            children_files.setdefault(parent_path(info["name"]), []).append(info)
+        for info in dir_infos:
+            children_dirs.setdefault(parent_path(info["name"]), []).append(info)
+
+        # Seed dircache so a later ls() of any walked directory is served from cache.
+        for node in (norm, *(info["name"] for info in dir_infos)):
+            self.dircache[node] = children_files.get(node, []) + children_dirs.get(
+                node, []
+            )
+
+        yield from self._walk_subtree(
+            norm, topdown, detail, children_dirs, children_files
+        )
+
+    def _walk_subtree(
+        self,
+        node: str,
+        topdown: bool,
+        detail: bool,
+        children_dirs: Mapping[str, list[InfoDict]],
+        children_files: Mapping[str, list[InfoDict]],
+    ) -> Generator[tuple[str, Any, Any], Any, None]:
+        dirs = {base_name(i["name"]): i for i in children_dirs.get(node, [])}
+        files = {base_name(i["name"]): i for i in children_files.get(node, [])}
+
+        dirs_out: Any = dirs if detail else list(dirs)
+        files_out: Any = files if detail else list(files)
+
+        if topdown:
+            yield node, dirs_out, files_out
+        # Iterating dirs_out (the yielded object) honors caller pruning when topdown.
+        for name in dirs_out:
+            yield from self._walk_subtree(
+                dirs[name]["name"], topdown, detail, children_dirs, children_files
+            )
+        if not topdown:
+            yield node, dirs_out, files_out
+
+    def du(
+        self,
+        path: str,
+        total: bool = True,
+        maxdepth: int | None = None,
+        withdirs: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        """Disk usage from one subtree walk, using the sizes `find` already returns.
+
+        Overridden so it does not fall back to fsspec's default (a `self.info` per file).
+        """
+        infos = cast(
+            "dict[str, InfoDict]",
+            self.find(path, maxdepth=maxdepth, withdirs=withdirs, detail=True),
+        )
+        sizes = {p: int(info.get("size") or 0) for p, info in infos.items()}
+        if total:
+            return sum(sizes.values())
+        return sizes
 
     def _open(
         self,
@@ -186,18 +394,30 @@ class DucktapeFileSystem(AbstractFileSystem):
         4.2.9+) is far faster than streaming byte ranges through Python.
         """
         norm = self._strip_protocol(rpath)
-        if self.isdir(norm):
+        info = self.info(norm)
+        if info["type"] == "directory":
             os.makedirs(lpath, exist_ok=True)
             return
+        callback.set_size(info["size"])
         with self._lock:
             session = self.session
-        session.data_objects.get(norm, lpath, num_threads=self.num_threads)
+        with _translate_errors(norm):
+            self._retry_hierarchy(
+                lambda: session.data_objects.get(
+                    norm,
+                    lpath,
+                    num_threads=self.num_threads,
+                    updatables=(_threadsafe_progress(callback),),
+                ),
+                norm,
+                on_retry=lambda: callback.absolute_update(0),
+            )
 
     # --- Write path -----------------------------------------------------------
 
     def mkdir(self, path: str, create_parents: bool = True, **kwargs: Any) -> None:
         norm = self._strip_protocol(path)
-        with self._lock:
+        with self._lock, _translate_errors(norm):
             self.session.collections.create(norm, recurse=create_parents)
         self.invalidate_cache(norm)
 
@@ -205,17 +425,20 @@ class DucktapeFileSystem(AbstractFileSystem):
         norm = self._strip_protocol(path)
         if not exist_ok and self.exists(norm):
             raise FileExistsError(norm)
-        with self._lock:
+        with self._lock, _translate_errors(norm):
             self.session.collections.create(norm, recurse=True)
         self.invalidate_cache(norm)
 
     def rmdir(self, path: str) -> None:
+        """Remove an empty collection. Idempotent: a missing collection is a no-op."""
         norm = self._strip_protocol(path)
+        if not self.exists(norm):
+            return
         try:
-            with self._lock:
+            with self._lock, _translate_errors(norm):
                 self.session.collections.remove(norm, recurse=False)
-        except CAT_COLLECTION_NOT_EMPTY as exc:
-            raise IrodsNotEmptyError(norm) from exc
+        except IrodsFileNotFoundError:
+            pass  # lost a race with another remover
         self.invalidate_cache(norm)
 
     def rm_file(self, path: str) -> None:
@@ -238,7 +461,9 @@ class DucktapeFileSystem(AbstractFileSystem):
     def cp_file(self, path1: str, path2: str, **kwargs: Any) -> None:
         src = self._strip_protocol(path1)
         dst = self._strip_protocol(path2)
-        with self._lock:
+        # Label errors with both paths: a copy can fail because of either the source or the
+        # destination, so naming only one would point debugging at the wrong path.
+        with self._lock, _translate_errors(f"{src} -> {dst}"):
             self.session.data_objects.copy(src, dst)
         self.invalidate_cache(dst)
 
@@ -255,7 +480,18 @@ class DucktapeFileSystem(AbstractFileSystem):
         if os.path.isdir(lpath):
             self.makedirs(norm, exist_ok=True)
             return
+        callback.set_size(os.path.getsize(lpath))
         with self._lock:
             session = self.session
-        session.data_objects.put(lpath, norm, num_threads=self.num_threads)
+        with _translate_errors(norm):
+            self._retry_hierarchy(
+                lambda: session.data_objects.put(
+                    lpath,
+                    norm,
+                    num_threads=self.num_threads,
+                    updatables=(_threadsafe_progress(callback),),
+                ),
+                norm,
+                on_retry=lambda: callback.absolute_update(0),
+            )
         self.invalidate_cache(norm)

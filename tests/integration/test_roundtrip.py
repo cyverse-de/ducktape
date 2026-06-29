@@ -15,6 +15,7 @@ from typing import cast
 import pytest
 
 from ducktape import listing
+from ducktape.file import DucktapeBufferedFile
 from ducktape.filesystem import DucktapeFileSystem
 
 Cleanup = Callable[[DucktapeFileSystem, str], None]
@@ -129,3 +130,49 @@ def test_concurrent_reads_checksum(
 
     for path, data in payloads.items():
         assert results[path] == data
+
+
+def test_concurrent_ranges_one_handle(
+    fs: DucktapeFileSystem, work_collection: str
+) -> None:
+    """Parallel range reads against a SINGLE file object must not corrupt each other.
+
+    DuckDB reads one Parquet file from several threads; the per-file lock makes the shared
+    handle's seek()+read() atomic. Exercises that path directly against a live handle.
+    """
+    chunk = 4096
+    payload = os.urandom(64 * chunk)
+    path = f"{work_collection}/single.bin"
+    _seed_object(fs, path, payload)
+
+    with fs.open(path, "rb") as raw:
+        handle = cast(DucktapeBufferedFile, raw)
+        spans = [(i * chunk, (i + 1) * chunk) for i in range(len(payload) // chunk)] * 4
+
+        def read_span(span: tuple[int, int]) -> tuple[int, bytes]:
+            start, end = span
+            return start, handle._fetch_range(start, end)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(read_span, spans))
+
+    for start, data in results:
+        assert data == payload[start : start + chunk]
+
+
+def test_find_and_glob_recursive(fs: DucktapeFileSystem, work_collection: str) -> None:
+    """find() and glob('**') return the whole subtree via the recursive GenQuery path."""
+    _seed_object(fs, f"{work_collection}/top.parquet", b"x")
+    fs.session.collections.create(f"{work_collection}/sub", recurse=True)
+    _seed_object(fs, f"{work_collection}/sub/nested.parquet", b"y")
+    fs.invalidate_cache()
+
+    found = set(fs.find(work_collection))
+    assert found == {
+        f"{work_collection}/top.parquet",
+        f"{work_collection}/sub/nested.parquet",
+    }
+
+    globbed = set(fs.glob(f"{work_collection}/**/*.parquet"))
+    assert f"{work_collection}/sub/nested.parquet" in globbed
+    assert f"{work_collection}/top.parquet" in globbed

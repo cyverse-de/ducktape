@@ -3,10 +3,22 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from irods.exception import CAT_COLLECTION_NOT_EMPTY, DataObjectDoesNotExist
+from fsspec.callbacks import Callback
+from irods.exception import (
+    CAT_COLLECTION_NOT_EMPTY,
+    CAT_NO_ROWS_FOUND,
+    HIERARCHY_ERROR,
+    CollectionDoesNotExist,
+    DataObjectDoesNotExist,
+    NetworkException,
+)
 
 from ducktape import listing
-from ducktape.errors import IrodsFileNotFoundError, IrodsNotEmptyError
+from ducktape.errors import (
+    IrodsFileNotFoundError,
+    IrodsNotEmptyError,
+    IrodsOperationError,
+)
 from ducktape.filesystem import DucktapeFileSystem
 
 
@@ -28,6 +40,7 @@ class RecordingDataObjects:
         self.calls: list[tuple] = []
         self.handle = WriteHandle()
         self.unlink_raises: Exception | None = None
+        self.copy_raises: Exception | None = None
 
     def open(self, path: str, mode: str, allow_redirect: object = None) -> WriteHandle:
         self.calls.append(("open", path, mode, allow_redirect))
@@ -40,18 +53,31 @@ class RecordingDataObjects:
 
     def copy(self, src: str, dst: str) -> None:
         self.calls.append(("copy", src, dst))
+        if self.copy_raises is not None:
+            raise self.copy_raises
 
-    def put(self, lpath: str, rpath: str, num_threads: int = 0) -> None:
+    def put(
+        self,
+        lpath: str,
+        rpath: str,
+        num_threads: int = 0,
+        updatables: tuple = (),
+    ) -> None:
         self.calls.append(("put", lpath, rpath, num_threads))
+        for update in updatables:
+            update(7)  # simulate one chunk so progress wiring is exercised
 
 
 class RecordingCollections:
     def __init__(self) -> None:
         self.calls: list[tuple] = []
         self.remove_raises: Exception | None = None
+        self.create_raises: Exception | None = None
 
     def create(self, path: str, recurse: bool = True) -> None:
         self.calls.append(("create", path, recurse))
+        if self.create_raises is not None:
+            raise self.create_raises
 
     def remove(self, path: str, recurse: bool = True, force: bool = False) -> None:
         self.calls.append(("remove", path, recurse, force))
@@ -106,11 +132,47 @@ def test_mkdir_creates_collection() -> None:
     assert ("create", "/z/home/rods/sub", True) in session.collections.calls
 
 
-def test_rmdir_maps_not_empty() -> None:
+def _existing_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        listing, "stat", lambda s, p: {"name": p, "type": "directory", "size": 0}
+    )
+
+
+def test_rmdir_maps_not_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    _existing_directory(monkeypatch)
     session = RecordingSession()
     session.collections.remove_raises = CAT_COLLECTION_NOT_EMPTY("not empty")
     fs = make_fs(session)
     with pytest.raises(IrodsNotEmptyError):
+        fs.rmdir("/z/home/rods/sub")
+
+
+def test_rmdir_missing_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = RecordingSession()
+    fs = make_fs(session)
+
+    def raise_missing(s: object, p: str) -> dict:
+        raise IrodsFileNotFoundError(p)
+
+    monkeypatch.setattr(listing, "stat", raise_missing)
+    fs.rmdir("/z/home/rods/missing")  # idempotent: must not raise
+    assert all(call[0] != "remove" for call in session.collections.calls)
+
+
+def test_rmdir_swallows_delete_race(monkeypatch: pytest.MonkeyPatch) -> None:
+    _existing_directory(monkeypatch)
+    session = RecordingSession()
+    session.collections.remove_raises = CollectionDoesNotExist("gone")
+    fs = make_fs(session)
+    fs.rmdir("/z/home/rods/raced")  # exists() passed, then removed by another: no raise
+
+
+def test_rmdir_maps_operation_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _existing_directory(monkeypatch)
+    session = RecordingSession()
+    session.collections.remove_raises = NetworkException("boom")
+    fs = make_fs(session)
+    with pytest.raises(IrodsOperationError):
         fs.rmdir("/z/home/rods/sub")
 
 
@@ -157,13 +219,15 @@ def test_cp_file_server_side_copy() -> None:
     ) in session.data_objects.calls
 
 
-def test_put_file_uses_parallel_transfer() -> None:
+def test_put_file_uses_parallel_transfer(tmp_path: Any) -> None:
     session = RecordingSession()
     fs = make_fs(session)
-    fs.put_file("/tmp/local.bin", "/z/home/rods/remote.bin")
+    local = tmp_path / "local.bin"
+    local.write_bytes(b"payload!")
+    fs.put_file(str(local), "/z/home/rods/remote.bin")
     assert (
         "put",
-        "/tmp/local.bin",
+        str(local),
         "/z/home/rods/remote.bin",
         0,
     ) in session.data_objects.calls
@@ -186,3 +250,127 @@ def test_append_mode_unsupported() -> None:
     fs = make_fs(session)
     with pytest.raises(NotImplementedError):
         fs.open("/z/home/rods/x.bin", "ab")
+
+
+_ERROR_MAP = [
+    (CollectionDoesNotExist, IrodsFileNotFoundError),
+    (CAT_NO_ROWS_FOUND, IrodsFileNotFoundError),
+    (NetworkException, IrodsOperationError),
+]
+
+
+@pytest.mark.parametrize("operation", ["mkdir", "cp_file"])
+@pytest.mark.parametrize(("prc_error", "expected"), _ERROR_MAP)
+def test_write_ops_map_prc_errors(
+    operation: str,
+    prc_error: type[Exception],
+    expected: type[Exception],
+) -> None:
+    session = RecordingSession()
+    if operation == "mkdir":
+        session.collections.create_raises = prc_error("boom")
+        action = lambda: make_fs(session).mkdir("/z/d")  # noqa: E731
+    else:
+        session.data_objects.copy_raises = prc_error("boom")
+        action = lambda: make_fs(session).cp_file("/z/a", "/z/b")  # noqa: E731
+    with pytest.raises(expected):
+        action()
+
+
+def test_get_file_progress_drives_callback(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = RecordingSession()
+
+    def fake_get(
+        path: str, lpath: str, num_threads: int = 0, updatables: tuple = ()
+    ) -> None:
+        for update in updatables:
+            update(40)
+            update(60)
+
+    session.data_objects.get = fake_get  # type: ignore[attr-defined]
+    fs = make_fs(session)
+    monkeypatch.setattr(
+        listing, "stat", lambda s, p: {"name": p, "type": "file", "size": 100}
+    )
+    callback = Callback()
+    fs.get_file("/z/home/rods/a.bin", "/tmp/out.bin", callback=callback)
+    assert callback.size == 100
+    assert callback.value == 100
+
+
+def test_put_file_progress_drives_callback(tmp_path: Any) -> None:
+    session = RecordingSession()
+
+    def fake_put(
+        lpath: str, rpath: str, num_threads: int = 0, updatables: tuple = ()
+    ) -> None:
+        for update in updatables:
+            update(8)
+
+    session.data_objects.put = fake_put  # type: ignore[attr-defined]
+    fs = make_fs(session)
+    local = tmp_path / "in.bin"
+    local.write_bytes(b"12345678")
+    callback = Callback()
+    fs.put_file(str(local), "/z/home/rods/remote.bin", callback=callback)
+    assert callback.size == 8
+    assert callback.value == 8
+
+
+def test_get_file_progress_resets_on_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = RecordingSession()
+    attempts = {"n": 0}
+
+    def fake_get(
+        path: str, lpath: str, num_threads: int = 0, updatables: tuple = ()
+    ) -> None:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            for update in updatables:
+                update(40)  # partial progress before the transient failure
+            raise HIERARCHY_ERROR("resource hierarchy race")
+        for update in updatables:
+            update(100)
+
+    session.data_objects.get = fake_get  # type: ignore[attr-defined]
+    fs = DucktapeFileSystem(
+        host="irods.example.org",
+        user="rods",
+        password="secret",
+        zone="tempZone",
+        hierarchy_retry_backoff=0,
+        skip_instance_cache=True,
+        session_provider=StubProvider(session),
+    )
+    monkeypatch.setattr(
+        listing, "stat", lambda s, p: {"name": p, "type": "file", "size": 100}
+    )
+    callback = Callback()
+    fs.get_file("/z/home/rods/a.bin", "/tmp/out.bin", callback=callback)
+    assert attempts["n"] == 2
+    assert callback.value == 100  # reset on retry, not 140
+
+
+def test_empty_file_write_creates_object() -> None:
+    session = RecordingSession()
+    fs = make_fs(session)
+    with fs.open("/z/home/rods/empty.bin", "wb"):
+        pass
+    do = session.data_objects
+    assert ("open", "/z/home/rods/empty.bin", "w", False) in do.calls
+    assert do.handle.written == b""
+    assert do.handle.closed is True
+
+
+def test_multi_chunk_write_appends_in_order() -> None:
+    session = RecordingSession()
+    fs = make_fs(session)
+    block = 5
+    payload = b"abcdefghijklmnopqrstuvwxyz"  # spans several blocks
+    with fs.open("/z/home/rods/big.bin", "wb", block_size=block) as handle:
+        written: Any = handle
+        written.write(payload)
+    do = session.data_objects
+    assert do.handle.written == payload
+    open_calls = [call for call in do.calls if call[0] == "open"]
+    assert len(open_calls) == 1  # one handle reused across chunks

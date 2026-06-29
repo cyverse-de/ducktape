@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+from irods.models import Collection, DataObject
 
 from ducktape import listing
 from ducktape.errors import IrodsFileNotFoundError
@@ -148,3 +149,89 @@ def test_stat_root_is_directory() -> None:
         "created": None,
         "modified": None,
     }
+
+
+class _FakeQuery:
+    """Returns a fixed row set regardless of filters, modelling iRODS LIKE over-matching.
+
+    Real GenQuery would prune by collection; here every query returns the full superset so
+    the tests assert that the Python prefix post-filter trims sibling over-matches.
+    """
+
+    def __init__(self, rows: list[dict[Any, Any]]) -> None:
+        self._rows = rows
+
+    def filter(self, *conditions: Any) -> _FakeQuery:
+        return self
+
+    def get_results(self) -> list[dict[Any, Any]]:
+        return list(self._rows)
+
+
+class _FakeSubtreeSession:
+    def __init__(
+        self, do_rows: list[dict[Any, Any]], coll_rows: list[dict[Any, Any]]
+    ) -> None:
+        self._do_rows = do_rows
+        self._coll_rows = coll_rows
+
+    def query(self, *columns: Any) -> _FakeQuery:
+        if any(column is DataObject.name for column in columns):
+            return _FakeQuery(self._do_rows)
+        return _FakeQuery(self._coll_rows)
+
+
+def _do_row(collection: str, name: str) -> dict[Any, Any]:
+    return {
+        Collection.name: collection,
+        DataObject.name: name,
+        DataObject.size: 5,
+        DataObject.modify_time: DT1,
+        DataObject.create_time: DT0,
+    }
+
+
+def _coll_row(name: str) -> dict[Any, Any]:
+    return {
+        Collection.name: name,
+        Collection.modify_time: DT1,
+        Collection.create_time: DT0,
+    }
+
+
+def test_walk_data_objects_excludes_sibling_overmatch() -> None:
+    session = cast(
+        "iRODSSession",
+        _FakeSubtreeSession(
+            do_rows=[
+                _do_row("/p", "a.bin"),
+                _do_row("/p/sub", "b.bin"),
+                _do_row("/p_x", "sibling.bin"),  # LIKE '/p/%' must not leak this in
+            ],
+            coll_rows=[],
+        ),
+    )
+    names = {info["name"] for info in listing.walk_data_objects(session, "/p")}
+    assert names == {"/p/a.bin", "/p/sub/b.bin"}
+
+
+def test_walk_collections_excludes_root_and_siblings() -> None:
+    session = cast(
+        "iRODSSession",
+        _FakeSubtreeSession(
+            do_rows=[],
+            coll_rows=[_coll_row("/p"), _coll_row("/p/sub"), _coll_row("/p_x")],
+        ),
+    )
+    infos = listing.walk_collections(session, "/p")
+    assert {info["name"] for info in infos} == {"/p/sub"}
+    assert all(info["type"] == "directory" for info in infos)
+
+
+def test_walk_data_objects_dedups_replicas_by_path() -> None:
+    rows = [_do_row("/p", "a.bin"), _do_row("/p", "a.bin")]  # two replicas
+    rows[1][DataObject.modify_time] = DT2
+    session = cast("iRODSSession", _FakeSubtreeSession(do_rows=rows, coll_rows=[]))
+    infos = listing.walk_data_objects(session, "/p")
+    assert len(infos) == 1
+    assert infos[0]["modified"] == DT2

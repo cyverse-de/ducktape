@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
-from ducktape.auth import DEFAULT_ENV_FILE, AuthConfig, resolve_auth
+from ducktape.auth import DEFAULT_ENV_FILE, AuthConfig, _make_session, resolve_auth
 from ducktape.errors import IrodsAuthError
 
 
@@ -82,3 +84,71 @@ def test_password_absent_from_repr() -> None:
         env={},
     )
     assert "super-secret" not in repr(config)
+
+
+def test_resolve_auth_carries_connection_options() -> None:
+    options = {"client_server_policy": "CS_NEG_REQUIRE", "ssl_verify_server": "cert"}
+    explicit = resolve_auth(
+        {
+            "host": "irods.example.org",
+            "user": "rods",
+            "password": "secret",
+            "zone": "tempZone",
+            "connection_options": options,
+        },
+        env={},
+    )
+    assert explicit.connection_options == options
+    env_file = resolve_auth({"connection_options": options}, env={})
+    assert env_file.mode == "env_file"
+    assert env_file.connection_options == options
+
+
+def test_connection_options_absent_from_repr() -> None:
+    config = resolve_auth(
+        {"connection_options": {"ssl_verify_server": "leaked?"}}, env={}
+    )
+    assert "leaked?" not in repr(config)
+
+
+class _FakeSession:
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+
+
+@pytest.fixture
+def capture_session(monkeypatch: pytest.MonkeyPatch) -> type[_FakeSession]:
+    import irods.session
+
+    monkeypatch.setattr(irods.session, "iRODSSession", _FakeSession)
+    return _FakeSession
+
+
+def test_make_session_forwards_connection_options_explicit(
+    capture_session: type[_FakeSession],
+) -> None:
+    config = AuthConfig(
+        mode="explicit",
+        host="irods.example.org",
+        port=1247,
+        user="rods",
+        zone="tempZone",
+        password="secret",
+        connection_options={"client_server_policy": "CS_NEG_REQUIRE"},
+    )
+    session: Any = _make_session(config)
+    assert session.kwargs["host"] == "irods.example.org"
+    assert session.kwargs["client_server_policy"] == "CS_NEG_REQUIRE"
+
+
+def test_make_session_forwards_connection_options_env_file(
+    capture_session: type[_FakeSession],
+) -> None:
+    config = AuthConfig(
+        mode="env_file",
+        env_file="/opt/env.json",
+        connection_options={"ssl_verify_server": "cert"},
+    )
+    session: Any = _make_session(config)
+    assert session.kwargs["ssl_verify_server"] == "cert"
+    assert session.kwargs["irods_env_file"].endswith("/opt/env.json")

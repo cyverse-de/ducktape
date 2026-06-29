@@ -12,7 +12,6 @@ keeps fsspec's caching layer keyed on normalized paths.
 from __future__ import annotations
 
 import logging
-from urllib.parse import urlsplit
 
 from .errors import IrodsPathError
 
@@ -29,26 +28,43 @@ def normalize_irods_path(raw: str | None) -> str:
     `storage_options`, and treating the first segment as either a host or a zone is the
     classic S3 "bucket or host" footgun. Collapses duplicate slashes and strips trailing
     slashes; `irods:///`, `irods://`, `/`, and `""` all map to the root `/`.
+
+    The path is parsed by hand rather than with `urllib.parse.urlsplit` because iRODS data
+    object names legitimately contain `#` and `?`, which a URL parser would strip as a
+    fragment/query and silently corrupt the path.
     """
     if raw is None or raw == "":
         return ROOT
 
-    parts = urlsplit(raw)
-    if parts.scheme and parts.scheme != PROTOCOL:
-        raise IrodsPathError(
-            f"unsupported scheme {parts.scheme!r}; expected {PROTOCOL!r} or a bare path"
-        )
-    if parts.netloc:
-        raise IrodsPathError(
-            f"unexpected host {parts.netloc!r} in iRODS path; the host belongs in "
-            f"storage_options — use {PROTOCOL}:///<zone>/... (three slashes)"
-        )
+    rest = raw
+    scheme, sep, after = raw.partition(":")
+    if sep and scheme and "/" not in scheme:
+        if scheme != PROTOCOL:
+            raise IrodsPathError(
+                f"unsupported scheme {scheme!r}; expected {PROTOCOL!r} or a bare path"
+            )
+        rest = after
+        # Strip an authority introduced by "//"; only the empty authority is allowed.
+        if rest.startswith("//"):
+            authority, slash, tail = rest[2:].partition("/")
+            if authority:
+                raise IrodsPathError(
+                    f"unexpected host {authority!r} in iRODS path; the host belongs in "
+                    f"storage_options — use {PROTOCOL}:///<zone>/... (three slashes)"
+                )
+            rest = slash + tail
 
-    path = parts.path
-    if path and not path.startswith("/"):
+    if rest and not rest.startswith("/"):
         logger.debug("normalizing relative iRODS path %r to absolute", raw)
 
-    segments = [segment for segment in path.split("/") if segment]
+    segments = [segment for segment in rest.split("/") if segment]
+    # iRODS logical paths are literal: "." and ".." are not parent/self traversal but
+    # would be treated as ordinary collection names. Reject them so a path like
+    # irods:///zone/../other can never be silently misinterpreted by the server.
+    if any(segment in (".", "..") for segment in segments):
+        raise IrodsPathError(
+            f"iRODS path may not contain '.' or '..' segments: {raw!r}"
+        )
     if not segments:
         return ROOT
     return "/" + "/".join(segments)

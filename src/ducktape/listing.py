@@ -11,9 +11,10 @@ dicts; the session-bound query functions are covered by the gated integration te
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING, Any
 
+from irods.column import Like
 from irods.models import Collection, DataObject
 
 from .errors import IrodsFileNotFoundError
@@ -29,19 +30,24 @@ def _join(collection: str, name: str) -> str:
     return f"{collection.rstrip('/')}/{name}"
 
 
-def dedup_replicas(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def dedup_replicas(
+    rows: Iterable[Mapping[str, Any]],
+    key: Callable[[Mapping[str, Any]], str] = lambda row: row["name"],
+) -> list[dict[str, Any]]:
     """Collapse one-row-per-replica GenQuery output to one row per data object.
 
     Keeps the replica with the latest `modify_time`, which is the one whose size and
-    timestamps best reflect the current object.
+    timestamps best reflect the current object. `key` selects the identity of a data object:
+    its name within a single collection (default), or its full path for cross-collection
+    subtree walks.
     """
-    by_name: dict[str, dict[str, Any]] = {}
+    by_key: dict[str, dict[str, Any]] = {}
     for row in rows:
-        name = row["name"]
-        current = by_name.get(name)
+        identity = key(row)
+        current = by_key.get(identity)
         if current is None or row["modify_time"] > current["modify_time"]:
-            by_name[name] = dict(row)
-    return list(by_name.values())
+            by_key[identity] = dict(row)
+    return list(by_key.values())
 
 
 def file_info(collection: str, row: Mapping[str, Any]) -> InfoDict:
@@ -179,3 +185,86 @@ def stat(session: iRODSSession, path: str) -> InfoDict:
         return dir_info(path, collection)
 
     raise IrodsFileNotFoundError(path)
+
+
+def _is_under(name: str, root: str) -> bool:
+    """True if `name` is `root` itself or a descendant path of `root`."""
+    if name == root:
+        return True
+    prefix = root if root.endswith("/") else root + "/"
+    return name.startswith(prefix)
+
+
+def _descendant_pattern(root: str) -> str:
+    """GenQuery LIKE pattern for collections strictly below `root` (excludes `root`)."""
+    prefix = "" if root == ROOT else root
+    return f"{prefix}/%"
+
+
+def _subtree_pattern(root: str) -> str:
+    """GenQuery LIKE pattern for `root` and everything below it."""
+    return "/%" if root == ROOT else f"{root}%"
+
+
+def _subtree_data_object_rows(
+    session: iRODSSession, root: str
+) -> Iterator[dict[str, Any]]:
+    # iRODS LIKE treats `_`/`%` as wildcards, so `root + "%"` can over-match siblings (and
+    # `_` is common in names). That is harmless here: the pattern always matches a *superset*
+    # of root and its descendants, and the `_is_under` post-filter trims it to the exact set.
+    # `%` after `root` (not `/%`) keeps files directly in `root` in the same single query.
+    query = session.query(
+        Collection.name,
+        DataObject.name,
+        DataObject.size,
+        DataObject.modify_time,
+        DataObject.create_time,
+    ).filter(Like(Collection.name, _subtree_pattern(root)))
+    for row in query.get_results():
+        collection = row[Collection.name]
+        if not _is_under(collection, root):
+            continue
+        yield {
+            "collection": collection,
+            "name": row[DataObject.name],
+            "size": row[DataObject.size],
+            "modify_time": row[DataObject.modify_time],
+            "create_time": row[DataObject.create_time],
+        }
+
+
+def walk_data_objects(session: iRODSSession, root: str) -> list[InfoDict]:
+    """Return fsspec file info dicts for every data object at or below `root`.
+
+    Uses a single subtree GenQuery regardless of tree depth, instead of one listing per
+    directory; replicas are deduplicated by full path.
+    """
+    rows = dedup_replicas(
+        _subtree_data_object_rows(session, root),
+        key=lambda row: _join(row["collection"], row["name"]),
+    )
+    return [file_info(row["collection"], row) for row in rows]
+
+
+def walk_collections(session: iRODSSession, root: str) -> list[InfoDict]:
+    """Return fsspec directory info dicts for every collection strictly below `root`."""
+    query = session.query(
+        Collection.name,
+        Collection.modify_time,
+        Collection.create_time,
+    ).filter(Like(Collection.name, _descendant_pattern(root)))
+    infos = []
+    for row in query.get_results():
+        name = row[Collection.name]
+        if name == root or not _is_under(name, root):
+            continue
+        infos.append(
+            dir_info(
+                name,
+                {
+                    "modify_time": row[Collection.modify_time],
+                    "create_time": row[Collection.create_time],
+                },
+            )
+        )
+    return infos

@@ -14,9 +14,11 @@ write iRODS data objects. The primary consumers are DuckDB (via `register_filesy
 and a web-based data manager. It is designed for large directory listings (10k+ entries)
 and large file transfers (10s of GB).
 
-Supported operations: listing (`ls`/`info`/`exists`), reading (range reads + whole-file
-parallel `get`), writing (streaming `open("wb")` + whole-file parallel `put`), `mkdir`/
-`makedirs`/`rmdir`, idempotent `rm`, and server-side `copy`. Append mode is not supported.
+Supported operations: listing (`ls`/`info`/`exists`), recursive listing (`find`/`walk`/
+`glob`, which fetch a whole subtree in a constant number of catalog queries), reading (range
+reads + whole-file parallel `get`), writing (streaming `open("wb")` + whole-file parallel
+`put`, both driving fsspec progress callbacks), `mkdir`/`makedirs`/`rmdir`, idempotent `rm`,
+and server-side `copy`. Append mode is not supported.
 
 ## Paths
 
@@ -67,6 +69,13 @@ under concurrent opens (`HIERARCHY_ERROR`) and undermines connection pooling. Pa
 `allow_redirect=True` only for single-stream access where direct-to-resource routing is
 worth that cost.
 
+Even with redirect off, concurrent opens can still intermittently hit `HIERARCHY_ERROR`
+while the server resolves the resource hierarchy. Opens (and parallel `get`/`put`) are
+therefore retried automatically — `hierarchy_retries` times (default `3`) with a
+`hierarchy_retry_backoff`-second linear backoff (default `0.1`). Set `hierarchy_retries=0`
+to disable. Range reads on an already-open file are serialized by a per-file lock, so a
+single file object is safe to read from multiple threads (as DuckDB does).
+
 ## Authentication
 
 Resolved by `ducktape.auth.resolve_auth`, precedence **explicit > environment file**:
@@ -76,6 +85,25 @@ Resolved by `ducktape.auth.resolve_auth`, precedence **explicit > environment fi
   option.
 - **Environment file** — otherwise the standard iRODS env file is used, located via
   `irods_env_file` option → `IRODS_ENVIRONMENT_FILE` env → `~/.irods/irods_environment.json`.
+
+### TLS and other connection options
+
+Explicit mode forwards anything in `connection_options` straight to `iRODSSession`, so you
+can require TLS (or set any other PRC connection setting) against servers that need it:
+
+```python
+fs = fsspec.filesystem(
+    "irods",
+    host="irods.example.org", user="rods", password="...", zone="tempZone",
+    connection_options={
+        "client_server_negotiation": "request_server_negotiation",
+        "client_server_policy": "CS_NEG_REQUIRE",   # require encryption
+        "ssl_verify_server": "cert",
+    },
+)
+```
+
+Environment-file mode reads negotiation/TLS settings from the JSON file as usual.
 
 ## Development
 
