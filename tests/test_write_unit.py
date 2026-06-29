@@ -4,6 +4,7 @@ from typing import Any
 
 import pytest
 from fsspec.callbacks import Callback
+from irods import keywords as kw
 from irods.exception import (
     CAT_COLLECTION_NOT_EMPTY,
     CAT_NO_ROWS_FOUND,
@@ -51,8 +52,8 @@ class RecordingDataObjects:
         if self.unlink_raises is not None:
             raise self.unlink_raises
 
-    def copy(self, src: str, dst: str) -> None:
-        self.calls.append(("copy", src, dst))
+    def copy(self, src: str, dst: str, **options: object) -> None:
+        self.calls.append(("copy", src, dst, options))
         if self.copy_raises is not None:
             raise self.copy_raises
 
@@ -216,6 +217,7 @@ def test_cp_file_server_side_copy() -> None:
         "copy",
         "/z/home/rods/a.bin",
         "/z/home/rods/b.bin",
+        {kw.FORCE_FLAG_KW: ""},
     ) in session.data_objects.calls
 
 

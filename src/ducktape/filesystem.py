@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from fsspec.callbacks import DEFAULT_CALLBACK, Callback
 from fsspec.spec import AbstractFileSystem
+from irods import keywords as kw
 from irods.exception import (
     CAT_COLLECTION_NOT_EMPTY,
     CAT_NO_ROWS_FOUND,
@@ -461,10 +462,13 @@ class DucktapeFileSystem(AbstractFileSystem):
     def cp_file(self, path1: str, path2: str, **kwargs: Any) -> None:
         src = self._strip_protocol(path1)
         dst = self._strip_protocol(path2)
+        # Force overwrite: iRODS rejects a copy onto an existing data object without the force
+        # flag, but fsspec's mv (copy + rm) is how DuckDB renames its temp output over the
+        # final target, so a second COPY TO the same path must clobber the prior object.
         # Label errors with both paths: a copy can fail because of either the source or the
         # destination, so naming only one would point debugging at the wrong path.
         with self._lock, _translate_errors(f"{src} -> {dst}"):
-            self.session.data_objects.copy(src, dst)
+            self.session.data_objects.copy(src, dst, **{kw.FORCE_FLAG_KW: ""})
         self.invalidate_cache(dst)
 
     def put_file(

@@ -97,6 +97,19 @@ def test_cp_file(fs: DucktapeFileSystem, work_collection: str) -> None:
         assert cast(bytes, handle.read()) == payload
 
 
+def test_cp_file_overwrites_existing(
+    fs: DucktapeFileSystem, work_collection: str
+) -> None:
+    src = f"{work_collection}/src.bin"
+    dst = f"{work_collection}/dst.bin"
+    _write_object(fs, dst, b"stale")
+    _write_object(fs, src, b"fresh")
+    # mirrors DuckDB's temp->target rename (fsspec mv): the copy must clobber an existing dst.
+    fs.cp_file(src, dst)
+    with fs.open(dst, "rb") as handle:
+        assert cast(bytes, handle.read()) == b"fresh"
+
+
 def test_put_file_parallel(
     fs: DucktapeFileSystem, work_collection: str, tmp_path: object
 ) -> None:
