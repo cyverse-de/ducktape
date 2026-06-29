@@ -83,13 +83,18 @@ class DucktapeBufferedFile(AbstractBufferedFile):
         try:
             super().close()
         finally:
-            handle, self._handle = self._handle, None
-            if handle is not None:
-                try:
-                    handle.close()
-                except Exception:
-                    # The connection may already be gone (e.g. closed during shutdown
-                    # via __del__); releasing it best-effort avoids noisy errors.
-                    logger.debug(
-                        "error closing iRODS handle for %s", self.path, exc_info=True
-                    )
+            # Hold the per-file lock so we never close the handle out from under an
+            # in-flight _fetch_range (which seeks+reads on this same handle).
+            with self._handle_lock:
+                handle, self._handle = self._handle, None
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except Exception:
+                        # The connection may already be gone (e.g. closed during shutdown
+                        # via __del__); releasing it best-effort avoids noisy errors.
+                        logger.debug(
+                            "error closing iRODS handle for %s",
+                            self.path,
+                            exc_info=True,
+                        )

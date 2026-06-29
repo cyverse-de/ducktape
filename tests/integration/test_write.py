@@ -58,6 +58,35 @@ def test_rm_file_idempotent(fs: DucktapeFileSystem, work_collection: str) -> Non
     fs.rm_file(path)  # second delete must succeed silently
 
 
+def test_rmdir_idempotent(fs: DucktapeFileSystem, work_collection: str) -> None:
+    sub = f"{work_collection}/gone"
+    fs.mkdir(sub)
+    fs.rmdir(sub)
+    assert not fs.exists(sub)
+    fs.rmdir(sub)  # second rmdir of a missing collection must succeed silently
+
+
+def test_special_character_name_roundtrips(
+    fs: DucktapeFileSystem, work_collection: str
+) -> None:
+    """An object whose name contains '#'/'?' must be addressable end to end."""
+    path = f"{work_collection}/run#2?v=1.bin"
+    payload = b"special-name"
+    _write_object(fs, path, payload)
+    assert fs.exists(path)
+    assert fs.info(path)["size"] == len(payload)
+    with fs.open(path, "rb") as handle:
+        assert cast(bytes, handle.read()) == payload
+    assert path in set(fs.find(work_collection))
+
+
+def test_du_reports_total_size(fs: DucktapeFileSystem, work_collection: str) -> None:
+    _write_object(fs, f"{work_collection}/x.bin", b"abc")
+    _write_object(fs, f"{work_collection}/y.bin", b"de")
+    fs.invalidate_cache()
+    assert fs.du(work_collection) == 5
+
+
 def test_cp_file(fs: DucktapeFileSystem, work_collection: str) -> None:
     src = f"{work_collection}/src.bin"
     dst = f"{work_collection}/dst.bin"

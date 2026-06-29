@@ -7,6 +7,7 @@ from fsspec.callbacks import Callback
 from irods.exception import (
     CAT_COLLECTION_NOT_EMPTY,
     CAT_NO_ROWS_FOUND,
+    HIERARCHY_ERROR,
     CollectionDoesNotExist,
     DataObjectDoesNotExist,
     NetworkException,
@@ -131,11 +132,47 @@ def test_mkdir_creates_collection() -> None:
     assert ("create", "/z/home/rods/sub", True) in session.collections.calls
 
 
-def test_rmdir_maps_not_empty() -> None:
+def _existing_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        listing, "stat", lambda s, p: {"name": p, "type": "directory", "size": 0}
+    )
+
+
+def test_rmdir_maps_not_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    _existing_directory(monkeypatch)
     session = RecordingSession()
     session.collections.remove_raises = CAT_COLLECTION_NOT_EMPTY("not empty")
     fs = make_fs(session)
     with pytest.raises(IrodsNotEmptyError):
+        fs.rmdir("/z/home/rods/sub")
+
+
+def test_rmdir_missing_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = RecordingSession()
+    fs = make_fs(session)
+
+    def raise_missing(s: object, p: str) -> dict:
+        raise IrodsFileNotFoundError(p)
+
+    monkeypatch.setattr(listing, "stat", raise_missing)
+    fs.rmdir("/z/home/rods/missing")  # idempotent: must not raise
+    assert all(call[0] != "remove" for call in session.collections.calls)
+
+
+def test_rmdir_swallows_delete_race(monkeypatch: pytest.MonkeyPatch) -> None:
+    _existing_directory(monkeypatch)
+    session = RecordingSession()
+    session.collections.remove_raises = CollectionDoesNotExist("gone")
+    fs = make_fs(session)
+    fs.rmdir("/z/home/rods/raced")  # exists() passed, then removed by another: no raise
+
+
+def test_rmdir_maps_operation_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _existing_directory(monkeypatch)
+    session = RecordingSession()
+    session.collections.remove_raises = NetworkException("boom")
+    fs = make_fs(session)
+    with pytest.raises(IrodsOperationError):
         fs.rmdir("/z/home/rods/sub")
 
 
@@ -222,10 +259,7 @@ _ERROR_MAP = [
 ]
 
 
-@pytest.mark.parametrize(
-    "operation",
-    ["mkdir", "rmdir", "cp_file"],
-)
+@pytest.mark.parametrize("operation", ["mkdir", "cp_file"])
 @pytest.mark.parametrize(("prc_error", "expected"), _ERROR_MAP)
 def test_write_ops_map_prc_errors(
     operation: str,
@@ -236,9 +270,6 @@ def test_write_ops_map_prc_errors(
     if operation == "mkdir":
         session.collections.create_raises = prc_error("boom")
         action = lambda: make_fs(session).mkdir("/z/d")  # noqa: E731
-    elif operation == "rmdir":
-        session.collections.remove_raises = prc_error("boom")
-        action = lambda: make_fs(session).rmdir("/z/d")  # noqa: E731
     else:
         session.data_objects.copy_raises = prc_error("boom")
         action = lambda: make_fs(session).cp_file("/z/a", "/z/b")  # noqa: E731
@@ -284,6 +315,40 @@ def test_put_file_progress_drives_callback(tmp_path: Any) -> None:
     fs.put_file(str(local), "/z/home/rods/remote.bin", callback=callback)
     assert callback.size == 8
     assert callback.value == 8
+
+
+def test_get_file_progress_resets_on_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = RecordingSession()
+    attempts = {"n": 0}
+
+    def fake_get(
+        path: str, lpath: str, num_threads: int = 0, updatables: tuple = ()
+    ) -> None:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            for update in updatables:
+                update(40)  # partial progress before the transient failure
+            raise HIERARCHY_ERROR("resource hierarchy race")
+        for update in updatables:
+            update(100)
+
+    session.data_objects.get = fake_get  # type: ignore[attr-defined]
+    fs = DucktapeFileSystem(
+        host="irods.example.org",
+        user="rods",
+        password="secret",
+        zone="tempZone",
+        hierarchy_retry_backoff=0,
+        skip_instance_cache=True,
+        session_provider=StubProvider(session),
+    )
+    monkeypatch.setattr(
+        listing, "stat", lambda s, p: {"name": p, "type": "file", "size": 100}
+    )
+    callback = Callback()
+    fs.get_file("/z/home/rods/a.bin", "/tmp/out.bin", callback=callback)
+    assert attempts["n"] == 2
+    assert callback.value == 100  # reset on retry, not 140
 
 
 def test_empty_file_write_creates_object() -> None:

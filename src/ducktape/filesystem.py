@@ -15,7 +15,7 @@ import threading
 import time
 from collections.abc import Generator, Iterator, Mapping
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from fsspec.callbacks import DEFAULT_CALLBACK, Callback
 from fsspec.spec import AbstractFileSystem
@@ -161,12 +161,19 @@ class DucktapeFileSystem(AbstractFileSystem):
         """Guards connection checkout and metadata queries (not byte transfers)."""
         return self._lock
 
-    def _retry_hierarchy(self, operation: Callable[[], Any], path: str) -> Any:
+    def _retry_hierarchy(
+        self,
+        operation: Callable[[], Any],
+        path: str,
+        on_retry: Callable[[], None] | None = None,
+    ) -> Any:
         """Run `operation`, retrying transient iRODS HIERARCHY_ERRORs.
 
         On iRODS >= 4.3.1 a concurrent open can fail while the server resolves the resource
         hierarchy; a short retry almost always succeeds. Only HIERARCHY_ERROR is retried, and
         only up to `hierarchy_retries` times — every other error propagates immediately.
+        `on_retry` runs before each retry (e.g. to reset a progress callback that the failed
+        attempt may have partially advanced).
         """
         attempt = 0
         while True:
@@ -176,6 +183,8 @@ class DucktapeFileSystem(AbstractFileSystem):
                 if attempt >= self.hierarchy_retries:
                     raise
                 attempt += 1
+                if on_retry is not None:
+                    on_retry()
                 logger.warning(
                     "iRODS HIERARCHY_ERROR on %s; retry %d/%d. This is the iRODS >= 4.3.1 "
                     "resource-hierarchy race under concurrent opens; a retry usually clears it.",
@@ -246,23 +255,35 @@ class DucktapeFileSystem(AbstractFileSystem):
         topdown: bool = True,
         on_error: str = "omit",
         **kwargs: Any,
-    ) -> Generator[tuple[str, Any, Any], Any, None]:
-        """Recursively walk a subtree using a constant number of GenQueries.
+    ) -> Generator[Any, Any, None]:
+        """Recursively walk a subtree.
 
-        fsspec's default `walk` issues one `ls` (≈2 catalog queries) per directory; iRODS can
-        return a whole subtree with a single `LIKE` filter on the collection path, so this
-        fetches the tree once and yields it in the same `(path, dirs, files)` contract.
-        `find`/`glob`/`du` are built on `walk`, so they inherit the speedup.
+        For an unbounded walk, iRODS can return the whole subtree with a single `LIKE`
+        filter on the collection path, so this fetches the tree once and yields it in the
+        standard `(path, dirs, files)` contract — `find`/`glob` (unbounded) inherit that
+        speedup. A bounded walk (`maxdepth` set) delegates to fsspec's per-directory `ls`,
+        which fetches only the requested depth instead of the entire subtree.
         """
         if maxdepth is not None and maxdepth < 1:
             raise ValueError("maxdepth must be at least 1")
+        if maxdepth is not None:
+            yield from super().walk(path, maxdepth, topdown, on_error, **kwargs)
+            return
+
         norm = self._strip_protocol(path)
         detail = kwargs.pop("detail", False)
         try:
+            # Acquire the lock separately per query: each GenQuery's continuation must page
+            # on a consistent pool connection (so it can't be interleaved), but releasing
+            # between queries lets concurrent opens/info proceed instead of waiting out the
+            # whole subtree scan.
             with self._lock:
-                if listing.stat(self.session, norm)["type"] != "directory":
-                    return  # find()'s isfile fallback handles a file path
+                is_directory = listing.stat(self.session, norm)["type"] == "directory"
+            if not is_directory:
+                return  # find()'s isfile fallback handles a file path
+            with self._lock:
                 file_infos = listing.walk_data_objects(self.session, norm)
+            with self._lock:
                 dir_infos = listing.walk_collections(self.session, norm)
         except (FileNotFoundError, OSError) as exc:
             if on_error == "raise":
@@ -278,22 +299,24 @@ class DucktapeFileSystem(AbstractFileSystem):
         for info in dir_infos:
             children_dirs.setdefault(parent_path(info["name"]), []).append(info)
 
+        # Seed dircache so a later ls() of any walked directory is served from cache.
+        for node in (norm, *(info["name"] for info in dir_infos)):
+            self.dircache[node] = children_files.get(node, []) + children_dirs.get(
+                node, []
+            )
+
         yield from self._walk_subtree(
-            norm, maxdepth, topdown, detail, children_dirs, children_files
+            norm, topdown, detail, children_dirs, children_files
         )
 
     def _walk_subtree(
         self,
         node: str,
-        maxdepth: int | None,
         topdown: bool,
         detail: bool,
         children_dirs: Mapping[str, list[InfoDict]],
         children_files: Mapping[str, list[InfoDict]],
     ) -> Generator[tuple[str, Any, Any], Any, None]:
-        full_dirs = {
-            base_name(i["name"]): i["name"] for i in children_dirs.get(node, [])
-        }
         dirs = {base_name(i["name"]): i for i in children_dirs.get(node, [])}
         files = {base_name(i["name"]): i for i in children_files.get(node, [])}
 
@@ -302,28 +325,34 @@ class DucktapeFileSystem(AbstractFileSystem):
 
         if topdown:
             yield node, dirs_out, files_out
-
-        if maxdepth is not None:
-            maxdepth -= 1
-            if maxdepth < 1:
-                if not topdown:
-                    yield node, dirs_out, files_out
-                return
-
-        for (
-            name
-        ) in dirs_out:  # iterating the yielded object honors caller pruning (topdown)
+        # Iterating dirs_out (the yielded object) honors caller pruning when topdown.
+        for name in dirs_out:
             yield from self._walk_subtree(
-                full_dirs[name],
-                maxdepth,
-                topdown,
-                detail,
-                children_dirs,
-                children_files,
+                dirs[name]["name"], topdown, detail, children_dirs, children_files
             )
-
         if not topdown:
             yield node, dirs_out, files_out
+
+    def du(
+        self,
+        path: str,
+        total: bool = True,
+        maxdepth: int | None = None,
+        withdirs: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        """Disk usage from one subtree walk, using the sizes `find` already returns.
+
+        Overridden so it does not fall back to fsspec's default (a `self.info` per file).
+        """
+        infos = cast(
+            "dict[str, InfoDict]",
+            self.find(path, maxdepth=maxdepth, withdirs=withdirs, detail=True),
+        )
+        sizes = {p: int(info.get("size") or 0) for p, info in infos.items()}
+        if total:
+            return sum(sizes.values())
+        return sizes
 
     def _open(
         self,
@@ -381,6 +410,7 @@ class DucktapeFileSystem(AbstractFileSystem):
                     updatables=(_threadsafe_progress(callback),),
                 ),
                 norm,
+                on_retry=lambda: callback.absolute_update(0),
             )
 
     # --- Write path -----------------------------------------------------------
@@ -400,9 +430,15 @@ class DucktapeFileSystem(AbstractFileSystem):
         self.invalidate_cache(norm)
 
     def rmdir(self, path: str) -> None:
+        """Remove an empty collection. Idempotent: a missing collection is a no-op."""
         norm = self._strip_protocol(path)
-        with self._lock, _translate_errors(norm):
-            self.session.collections.remove(norm, recurse=False)
+        if not self.exists(norm):
+            return
+        try:
+            with self._lock, _translate_errors(norm):
+                self.session.collections.remove(norm, recurse=False)
+        except IrodsFileNotFoundError:
+            pass  # lost a race with another remover
         self.invalidate_cache(norm)
 
     def rm_file(self, path: str) -> None:
@@ -425,7 +461,9 @@ class DucktapeFileSystem(AbstractFileSystem):
     def cp_file(self, path1: str, path2: str, **kwargs: Any) -> None:
         src = self._strip_protocol(path1)
         dst = self._strip_protocol(path2)
-        with self._lock, _translate_errors(src):
+        # Label errors with both paths: a copy can fail because of either the source or the
+        # destination, so naming only one would point debugging at the wrong path.
+        with self._lock, _translate_errors(f"{src} -> {dst}"):
             self.session.data_objects.copy(src, dst)
         self.invalidate_cache(dst)
 
@@ -454,5 +492,6 @@ class DucktapeFileSystem(AbstractFileSystem):
                     updatables=(_threadsafe_progress(callback),),
                 ),
                 norm,
+                on_retry=lambda: callback.absolute_update(0),
             )
         self.invalidate_cache(norm)

@@ -53,6 +53,21 @@ def test_normalize_rejects_foreign_scheme() -> None:
 
 
 @pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("/zone/home/rods/run#2.parquet", "/zone/home/rods/run#2.parquet"),
+        ("irods:///zone/home/rods/run#2.parquet", "/zone/home/rods/run#2.parquet"),
+        ("/zone/home/rods/query?x.csv", "/zone/home/rods/query?x.csv"),
+        ("irods:///zone/a#b?c/d.bin", "/zone/a#b?c/d.bin"),
+    ],
+    ids=["hash-bare", "hash-url", "question-bare", "both"],
+)
+def test_normalize_preserves_hash_and_question(raw: str, expected: str) -> None:
+    # iRODS object names may contain '#' and '?'; a URL parser would drop them.
+    assert normalize_irods_path(raw) == expected
+
+
+@pytest.mark.parametrize(
     "raw",
     [
         "/tempZone/home/rods/../secret",
