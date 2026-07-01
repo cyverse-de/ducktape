@@ -56,6 +56,22 @@ def test_close_releases_provider() -> None:
     assert provider.closed is True
 
 
+def test_context_manager_closes_provider() -> None:
+    provider = FakeProvider()
+    fs = DucktapeFileSystem(
+        host="irods.example.org",
+        user="rods",
+        password="secret",
+        zone="tempZone",
+        skip_instance_cache=True,
+        session_provider=provider,
+    )
+    with fs as entered:
+        assert entered is fs
+        assert provider.closed is False
+    assert provider.closed is True
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [

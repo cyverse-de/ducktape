@@ -32,3 +32,37 @@ jobs:
       # Integration tests auto-skip unless IRODS_TEST_HOST is set, so this runs the unit suite.
       - name: Test
         run: uv run pytest
+
+  # Runs the tests/integration suite against a dockerized single-provider iRODS zone.
+  # Non-blocking (continue-on-error) until it has proven stable; promote to required then.
+  integration:
+    runs-on: ubuntu-latest
+    needs: check
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Sync dependencies
+        run: uv sync --dev
+
+      - name: Start iRODS
+        run: docker compose -f tests/integration/docker-compose.yml up -d --build --wait
+
+      - name: Integration tests
+        env:
+          IRODS_TEST_HOST: localhost
+          IRODS_TEST_USER: rods
+          IRODS_TEST_PASSWORD: rods
+          IRODS_TEST_ZONE: tempZone
+          IRODS_TEST_COLLECTION: /tempZone/home/rods/ducktape-it
+        run: uv run pytest tests/integration -v
+
+      - name: Show iRODS logs on failure
+        if: failure()
+        run: docker compose -f tests/integration/docker-compose.yml logs irods-catalog-provider

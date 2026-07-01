@@ -1,0 +1,34 @@
+# A minimal single-provider iRODS zone for the integration tests, adapted from
+# https://github.com/irods/irods_demo (postgres catalog + catalog provider, no demo
+# extras). Used by the CI `integration` job; run locally with:
+#
+#   docker compose -f tests/integration/docker-compose.yml up -d --build --wait
+#   IRODS_TEST_HOST=localhost IRODS_TEST_USER=rods IRODS_TEST_PASSWORD=rods \
+#     IRODS_TEST_ZONE=tempZone uv run pytest tests/integration -v
+name: ducktape-irods-it
+
+services:
+    irods-catalog:
+        image: postgres:17
+        environment:
+            - POSTGRES_PASSWORD=testpassword
+        volumes:
+            - ./irods/init-user-db.sh:/docker-entrypoint-initdb.d/init-user-db.sh:ro
+
+    irods-catalog-provider:
+        build:
+            context: irods
+        shm_size: 500mb
+        ports:
+            - "1247:1247"
+            # Server high-port range for parallel transfers.
+            - "20000-20199:20000-20199"
+        healthcheck:
+            test: ["CMD", "su", "-", "irods", "-c", 'echo -e "\x00\x00\x00\x33<MsgHeader_PI><type>HEARTBEAT</type></MsgHeader_PI>" | (exec 3<>/dev/tcp/127.0.0.1/1247; cat >&3; cat <&3; exec 3<&-)']
+            interval: 10s
+            timeout: 10s
+            retries: 6
+            start_period: 30s
+            start_interval: 10s
+        depends_on:
+            - irods-catalog

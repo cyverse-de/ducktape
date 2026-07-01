@@ -210,6 +210,14 @@ class DucktapeFileSystem(AbstractFileSystem):
         """Release the iRODS session and its connection pool."""
         self._provider.close()
 
+    def __enter__(self) -> DucktapeFileSystem:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        # Best used with skip_instance_cache=True: fsspec caches instances by default,
+        # and closing a cached instance closes it for every other holder too.
+        self.close()
+
     def invalidate_cache(self, path: str | None = None) -> None:
         if path is None:
             self.dircache.clear()
