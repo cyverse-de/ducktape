@@ -34,11 +34,9 @@ jobs:
         run: uv run pytest
 
   # Runs the tests/integration suite against a dockerized single-provider iRODS zone.
-  # Non-blocking (continue-on-error) until it has proven stable; promote to required then.
   integration:
     runs-on: ubuntu-latest
     needs: check
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
