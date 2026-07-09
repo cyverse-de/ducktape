@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from fsspec.callbacks import Callback
@@ -20,6 +20,7 @@ from ducktape.errors import (
     IrodsNotEmptyError,
     IrodsOperationError,
 )
+from ducktape.file import DucktapeBufferedFile
 from ducktape.filesystem import DucktapeFileSystem
 
 
@@ -42,6 +43,7 @@ class RecordingDataObjects:
         self.handle = WriteHandle()
         self.unlink_raises: Exception | None = None
         self.copy_raises: Exception | None = None
+        self.move_raises: Exception | None = None
 
     def open(self, path: str, mode: str, allow_redirect: object = None) -> WriteHandle:
         self.calls.append(("open", path, mode, allow_redirect))
@@ -56,6 +58,11 @@ class RecordingDataObjects:
         self.calls.append(("copy", src, dst, options))
         if self.copy_raises is not None:
             raise self.copy_raises
+
+    def move(self, src: str, dst: str) -> None:
+        self.calls.append(("move", src, dst))
+        if self.move_raises is not None:
+            raise self.move_raises
 
     def put(
         self,
@@ -84,6 +91,9 @@ class RecordingCollections:
         self.calls.append(("remove", path, recurse, force))
         if self.remove_raises is not None:
             raise self.remove_raises
+
+    def move(self, src: str, dst: str) -> None:
+        self.calls.append(("move", src, dst))
 
 
 class RecordingSession:
@@ -351,6 +361,244 @@ def test_get_file_progress_resets_on_retry(monkeypatch: pytest.MonkeyPatch) -> N
     fs.get_file("/z/home/rods/a.bin", "/tmp/out.bin", callback=callback)
     assert attempts["n"] == 2
     assert callback.value == 100  # reset on retry, not 140
+
+
+def _stat_map(entries: dict[str, dict]) -> Any:
+    """A listing.stat stub backed by a fixed path->info map; everything else is missing."""
+
+    def stat(session: object, path: str) -> dict:
+        try:
+            return entries[path]
+        except KeyError:
+            raise IrodsFileNotFoundError(path) from None
+
+    return stat
+
+
+def _file(path: str) -> dict:
+    return {"name": path, "type": "file", "size": 1}
+
+
+def _dir(path: str) -> dict:
+    return {"name": path, "type": "directory", "size": 0}
+
+
+def test_rm_file_maps_operation_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = RecordingSession()
+    session.data_objects.unlink_raises = NetworkException("boom")
+    fs = make_fs(session)
+    monkeypatch.setattr(listing, "stat", _stat_map({"/z/a.bin": _file("/z/a.bin")}))
+    with pytest.raises(IrodsOperationError):
+        fs.rm_file("/z/a.bin")
+
+
+def test_rm_file_probe_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A network error during the existence probe must raise, not silently skip."""
+    session = RecordingSession()
+    fs = make_fs(session)
+
+    def raise_network(session: object, path: str) -> dict:
+        raise NetworkException("connection lost")
+
+    monkeypatch.setattr(listing, "stat", raise_network)
+    with pytest.raises(IrodsOperationError):
+        fs.rm_file("/z/a.bin")
+    assert all(call[0] != "unlink" for call in session.data_objects.calls)
+
+
+def test_put_file_create_mode_rejects_existing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    session = RecordingSession()
+    fs = make_fs(session)
+    monkeypatch.setattr(
+        listing, "stat", _stat_map({"/z/exists.bin": _file("/z/exists.bin")})
+    )
+    local = tmp_path / "in.bin"
+    local.write_bytes(b"x")
+    with pytest.raises(FileExistsError):
+        fs.put_file(str(local), "/z/exists.bin", mode="create")
+    assert all(call[0] != "put" for call in session.data_objects.calls)
+
+
+def test_exclusive_create_rejects_existing(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = RecordingSession()
+    fs = make_fs(session)
+    monkeypatch.setattr(
+        listing, "stat", _stat_map({"/z/exists.bin": _file("/z/exists.bin")})
+    )
+    with pytest.raises(FileExistsError):
+        fs.open("/z/exists.bin", "xb")
+
+
+def test_exclusive_create_writes_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = RecordingSession()
+    fs = make_fs(session)
+    monkeypatch.setattr(listing, "stat", _stat_map({}))
+    with fs.open("/z/new.bin", "xb") as raw:
+        handle: Any = raw
+        handle.write(b"fresh")
+    do = session.data_objects
+    assert ("open", "/z/new.bin", "w", False) in do.calls
+    assert do.handle.written == b"fresh"
+
+
+def test_mv_file_renames_without_unlink_when_dst_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = RecordingSession()
+    fs = make_fs(session)
+    monkeypatch.setattr(listing, "stat", _stat_map({"/z/src.bin": _file("/z/src.bin")}))
+    fs.mv("/z/src.bin", "/z/dst.bin")
+    do = session.data_objects
+    assert ("move", "/z/src.bin", "/z/dst.bin") in do.calls
+    assert all(call[0] != "unlink" for call in do.calls)
+
+
+def test_mv_file_unlinks_existing_dst_before_rename(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = RecordingSession()
+    fs = make_fs(session)
+    monkeypatch.setattr(
+        listing,
+        "stat",
+        _stat_map(
+            {"/z/src.bin": _file("/z/src.bin"), "/z/dst.bin": _file("/z/dst.bin")}
+        ),
+    )
+    fs.mv("/z/src.bin", "/z/dst.bin")
+    do = session.data_objects
+    unlink_index = do.calls.index(("unlink", "/z/dst.bin", True))
+    move_index = do.calls.index(("move", "/z/src.bin", "/z/dst.bin"))
+    assert unlink_index < move_index
+
+
+def test_mv_same_path_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = RecordingSession()
+    fs = make_fs(session)
+    monkeypatch.setattr(listing, "stat", _stat_map({"/z/a.bin": _file("/z/a.bin")}))
+    fs.mv("/z/a.bin", "/z/a.bin")
+    assert session.data_objects.calls == []
+
+
+def test_mv_collection_renames(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = RecordingSession()
+    fs = make_fs(session)
+    monkeypatch.setattr(listing, "stat", _stat_map({"/z/dir": _dir("/z/dir")}))
+    fs.mv("/z/dir", "/z/dir2", recursive=True)
+    assert ("move", "/z/dir", "/z/dir2") in session.collections.calls
+
+
+def test_mv_file_onto_existing_collection_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = RecordingSession()
+    fs = make_fs(session)
+    monkeypatch.setattr(
+        listing,
+        "stat",
+        _stat_map({"/z/src.bin": _file("/z/src.bin"), "/z/dir": _dir("/z/dir")}),
+    )
+    fallback_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "fsspec.spec.AbstractFileSystem.mv",
+        lambda self, p1, p2, **kw: fallback_calls.append((p1, p2)),
+    )
+    fs.mv("/z/src.bin", "/z/dir")
+    assert fallback_calls == [("/z/src.bin", "/z/dir")]
+    assert session.data_objects.calls == []  # no native move, no unlink
+
+
+def test_mv_collection_evicts_descendant_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = RecordingSession()
+    fs = make_fs(session)
+    monkeypatch.setattr(listing, "stat", _stat_map({"/z/dir": _dir("/z/dir")}))
+    fs.dircache["/z/dir"] = []
+    fs.dircache["/z/dir/sub"] = []  # stale old-path listing after the rename
+    fs.dircache["/z/other"] = []
+    fs.mv("/z/dir", "/z/dir2", recursive=True)
+    assert "/z/dir" not in fs.dircache
+    assert "/z/dir/sub" not in fs.dircache
+    assert "/z/other" in fs.dircache
+
+
+@pytest.mark.parametrize(
+    ("recursive", "entries"),
+    [
+        (True, {"/z/dir": _dir("/z/dir"), "/z/dir2": _dir("/z/dir2")}),
+        (False, {"/z/dir": _dir("/z/dir")}),
+    ],
+    ids=["dst-exists", "non-recursive"],
+)
+def test_mv_collection_falls_back_to_copy(
+    monkeypatch: pytest.MonkeyPatch, recursive: bool, entries: dict[str, dict]
+) -> None:
+    """Cases a catalog rename cannot express delegate to fsspec's copy+rm mv."""
+    session = RecordingSession()
+    fs = make_fs(session)
+    monkeypatch.setattr(listing, "stat", _stat_map(entries))
+    fallback_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "fsspec.spec.AbstractFileSystem.mv",
+        lambda self, p1, p2, **kw: fallback_calls.append((p1, p2)),
+    )
+    fs.mv("/z/dir", "/z/dir2", recursive=recursive)
+    assert fallback_calls == [("/z/dir", "/z/dir2")]
+    assert all(call[0] != "move" for call in session.collections.calls)
+
+
+def test_transaction_write_stages_then_commits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = RecordingSession()
+    fs = make_fs(session)
+    monkeypatch.setattr(listing, "stat", _stat_map({}))
+    f = cast(
+        DucktapeBufferedFile, fs.open("/z/home/rods/out.bin", "wb", autocommit=False)
+    )
+    cast(Any, f).write(b"payload")
+    f.close()
+    do = session.data_objects
+    (open_call,) = [call for call in do.calls if call[0] == "open"]
+    staging = open_call[1]
+    assert staging.startswith("/z/home/rods/.out.bin.ducktape-tmp-")
+    assert do.handle.written == b"payload"
+    assert all(call[0] != "move" for call in do.calls)  # nothing published yet
+    f.commit()
+    assert ("move", staging, "/z/home/rods/out.bin") in do.calls
+
+
+def test_transaction_discard_unlinks_staging(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = RecordingSession()
+    fs = make_fs(session)
+    monkeypatch.setattr(
+        listing, "stat", lambda session, path: _file(path)
+    )  # staging object exists
+    f = cast(
+        DucktapeBufferedFile, fs.open("/z/home/rods/out.bin", "wb", autocommit=False)
+    )
+    cast(Any, f).write(b"payload")
+    f.close()
+    do = session.data_objects
+    (open_call,) = [call for call in do.calls if call[0] == "open"]
+    staging = open_call[1]
+    f.discard()
+    assert ("unlink", staging, True) in do.calls
+    assert all(call[0] != "move" for call in do.calls)
+
+
+def test_write_close_invalidates_parent_listing() -> None:
+    session = RecordingSession()
+    fs = make_fs(session)
+    f = fs.open("/z/home/rods/new.bin", "wb")
+    cast(Any, f).write(b"x")
+    # Re-cached between open and close (e.g. by a concurrent ls) — close must evict it.
+    fs.dircache["/z/home/rods"] = [{"name": "stale"}]
+    f.close()
+    assert "/z/home/rods" not in fs.dircache
 
 
 def test_empty_file_write_creates_object() -> None:

@@ -8,6 +8,11 @@ reads run without the lock because the handle owns its own connection.
 
 The write path opens the handle in `_initiate_upload` and streams each buffered block to
 it in `_upload_chunk`, so a multi-gigabyte write never stages the whole object in memory.
+
+Transactional writes (`autocommit=False`, e.g. inside `with fs.transaction:`) stream to a
+hidden staging object in the same collection; `commit()` renames it over the final path (a
+cheap catalog operation) and `discard()` unlinks it. A crash between close and commit can
+leave a `.<name>.ducktape-tmp-*` orphan behind; they are never swept automatically.
 """
 
 from __future__ import annotations
@@ -15,13 +20,23 @@ from __future__ import annotations
 import logging
 import threading
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from fsspec.spec import AbstractBufferedFile
+
+from .paths import ROOT, base_name, parent_path
 
 if TYPE_CHECKING:
     from .filesystem import DucktapeFileSystem
 
 logger = logging.getLogger("ducktape")
+
+
+def _staging_path(path: str) -> str:
+    """A hidden, collision-safe sibling path used to stage a transactional write."""
+    parent = parent_path(path)
+    prefix = "" if parent == ROOT else parent
+    return f"{prefix}/.{base_name(path)}.ducktape-tmp-{uuid4().hex[:8]}"
 
 
 class DucktapeBufferedFile(AbstractBufferedFile):
@@ -53,10 +68,19 @@ class DucktapeBufferedFile(AbstractBufferedFile):
             **kwargs,
         )
         self._handle: Any | None = None
+        # Where a transactional (autocommit=False) write is staged until commit().
+        self._staging_path: str | None = None
         # Guards the single shared PRC handle: DuckDB issues parallel range reads against the
         # same file object, and seek()+read() on one handle is not atomic. This serializes
         # range reads within a single file (handles for different files stay independent).
         self._handle_lock = threading.Lock()
+        # A collection stats fine (type "directory", size 0), so without this check
+        # reading one would silently return b"" instead of failing. Only when size is
+        # unset: then details were already fetched (no extra round trip), and an explicit
+        # size is the caller asserting the path is a file. Runs after the handle
+        # attributes exist so __del__ -> close() on the failed object stays safe.
+        if self.mode == "rb" and size is None and self.details["type"] == "directory":
+            raise IsADirectoryError(path)
 
     def _ensure_handle(self) -> Any:
         if self._handle is None:
@@ -70,7 +94,12 @@ class DucktapeBufferedFile(AbstractBufferedFile):
             return handle.read(end - start)
 
     def _initiate_upload(self) -> None:
-        self._handle = self.fs._open_data_object(self.path, "w")
+        target = self.path
+        if not self.autocommit:
+            # Stage in the same collection so commit() is a cheap catalog rename.
+            target = _staging_path(self.path)
+            self._staging_path = target
+        self._handle = self.fs._open_data_object(target, "w")
 
     def _upload_chunk(self, final: bool = False) -> None:
         if self._handle is None:
@@ -78,6 +107,20 @@ class DucktapeBufferedFile(AbstractBufferedFile):
         handle = self._handle
         assert handle is not None
         handle.write(self.buffer.getvalue())
+
+    def commit(self) -> None:
+        """Publish a transactional write by renaming the staged object over the target."""
+        if self._staging_path is None:
+            return
+        self.fs._move_file(self._staging_path, self.path)
+        self._staging_path = None
+
+    def discard(self) -> None:
+        """Roll back a transactional write by unlinking the staged object."""
+        if self._staging_path is None:
+            return
+        self.fs.rm_file(self._staging_path)
+        self._staging_path = None
 
     def close(self) -> None:
         try:

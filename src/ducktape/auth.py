@@ -47,6 +47,17 @@ class AuthConfig:
     connection_options: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
 
+def _validate_port(raw: Any) -> int:
+    """Fail fast on a malformed port instead of surfacing it at connect time."""
+    try:
+        port = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise IrodsAuthError(f"invalid iRODS port {raw!r}: must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise IrodsAuthError(f"invalid iRODS port {port}: must be in 1-65535")
+    return port
+
+
 def resolve_auth(
     storage_options: Mapping[str, Any], env: Mapping[str, str]
 ) -> AuthConfig:
@@ -63,7 +74,7 @@ def resolve_auth(
         config = AuthConfig(
             mode="explicit",
             host=storage_options.get("host"),
-            port=int(storage_options.get("port", DEFAULT_PORT)),
+            port=_validate_port(storage_options.get("port", DEFAULT_PORT)),
             user=storage_options.get("user"),
             zone=storage_options.get("zone"),
             password=password,

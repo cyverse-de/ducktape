@@ -24,7 +24,6 @@ from irods.exception import (
     CAT_COLLECTION_NOT_EMPTY,
     CAT_NO_ROWS_FOUND,
     HIERARCHY_ERROR,
-    DataObjectDoesNotExist,
     DoesNotExist,
     PycommandsException,
     iRODSException,
@@ -35,7 +34,7 @@ from .auth import DEFAULT_PORT, SessionProvider, SingleSessionProvider, resolve_
 from .errors import IrodsFileNotFoundError, IrodsNotEmptyError, IrodsOperationError
 from .file import DucktapeBufferedFile
 from .listing import InfoDict
-from .paths import base_name, normalize_irods_path, parent_path
+from .paths import base_name, is_under, normalize_irods_path, parent_path
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -196,7 +195,11 @@ class DucktapeFileSystem(AbstractFileSystem):
                 time.sleep(self.hierarchy_retry_backoff * attempt)
 
     def _open_data_object(self, path: str, mode: str) -> Any:
-        """Open a PRC data-object handle under the lock, retrying HIERARCHY_ERRORs."""
+        """Open a PRC data-object handle under the lock, retrying HIERARCHY_ERRORs.
+
+        Errors are translated after the retry layer so the retry still sees the raw
+        HIERARCHY_ERROR; only an exhausted retry surfaces it, as an `IrodsOperationError`.
+        """
 
         def opener() -> Any:
             with self._lock:
@@ -204,7 +207,8 @@ class DucktapeFileSystem(AbstractFileSystem):
                     path, mode, allow_redirect=self.allow_redirect
                 )
 
-        return self._retry_hierarchy(opener, path)
+        with _translate_errors(path):
+            return self._retry_hierarchy(opener, path)
 
     def close(self) -> None:
         """Release the iRODS session and its connection pool."""
@@ -226,12 +230,37 @@ class DucktapeFileSystem(AbstractFileSystem):
         self.dircache.pop(norm, None)
         self.dircache.pop(parent_path(norm), None)
 
+    def _invalidate_subtree(self, root: str) -> None:
+        """Evict `root`, its parent, and every cached descendant listing.
+
+        Needed when a whole collection changes path (mv): descendants cached by `walk`'s
+        dircache seeding would otherwise keep serving their old paths. Iterating the whole
+        dircache needs the lock — a concurrent ls() inserting a key mid-scan would raise.
+        """
+        with self._lock:
+            for key in [key for key in self.dircache if is_under(key, root)]:
+                self.dircache.pop(key, None)
+            self.dircache.pop(parent_path(root), None)
+
     # --- Read path ------------------------------------------------------------
 
     def info(self, path: str, **kwargs: Any) -> InfoDict:
         norm = self._strip_protocol(path)
-        with self._lock:
+        with self._lock, _translate_errors(norm):
             return listing.stat(self.session, norm)
+
+    def exists(self, path: str, **kwargs: Any) -> bool:
+        """True if the path exists; only "not found" means False.
+
+        Overrides fsspec's default, whose bare `except` treats *any* failure (network
+        drop, auth expiry) as "does not exist" — which would make the idempotent deletes
+        below silently no-op instead of surfacing the real error.
+        """
+        try:
+            self.info(path, **kwargs)
+            return True
+        except FileNotFoundError:
+            return False
 
     def ls(self, path: str, detail: bool = True, **kwargs: Any):
         norm = self._strip_protocol(path)
@@ -245,9 +274,10 @@ class DucktapeFileSystem(AbstractFileSystem):
                     if details["type"] == "file":
                         entries = [details]
                     else:
-                        entries = listing.list_collection_children(
-                            self.session, norm, self.listing_page_size
-                        )
+                        with _translate_errors(norm):
+                            entries = listing.list_collection_children(
+                                self.session, norm, self.listing_page_size
+                            )
                     self.dircache[norm] = entries
         return entries if detail else [entry["name"] for entry in entries]
 
@@ -286,13 +316,13 @@ class DucktapeFileSystem(AbstractFileSystem):
             # on a consistent pool connection (so it can't be interleaved), but releasing
             # between queries lets concurrent opens/info proceed instead of waiting out the
             # whole subtree scan.
-            with self._lock:
+            with self._lock, _translate_errors(norm):
                 is_directory = listing.stat(self.session, norm)["type"] == "directory"
             if not is_directory:
                 return  # find()'s isfile fallback handles a file path
-            with self._lock:
+            with self._lock, _translate_errors(norm):
                 file_infos = listing.walk_data_objects(self.session, norm)
-            with self._lock:
+            with self._lock, _translate_errors(norm):
                 dir_infos = listing.walk_collections(self.session, norm)
         except (FileNotFoundError, OSError) as exc:
             if on_error == "raise":
@@ -375,6 +405,9 @@ class DucktapeFileSystem(AbstractFileSystem):
         norm = self._strip_protocol(path)
         if "a" in mode:
             raise NotImplementedError("append mode is not supported")
+        # Client-side check only (TOCTOU window): PRC's open cannot express O_EXCL.
+        if "x" in mode and self.exists(norm):
+            raise FileExistsError(norm)
         if any(flag in mode for flag in ("w", "x")):
             self.invalidate_cache(parent_path(norm))
         return DucktapeBufferedFile(
@@ -461,9 +494,9 @@ class DucktapeFileSystem(AbstractFileSystem):
         if not self.exists(norm):
             return
         try:
-            with self._lock:
+            with self._lock, _translate_errors(norm):
                 self.session.data_objects.unlink(norm, force=True)
-        except (DataObjectDoesNotExist, CAT_NO_ROWS_FOUND):
+        except IrodsFileNotFoundError:
             pass  # lost a race with another deleter
         self.invalidate_cache(norm)
 
@@ -479,6 +512,61 @@ class DucktapeFileSystem(AbstractFileSystem):
             self.session.data_objects.copy(src, dst, **{kw.FORCE_FLAG_KW: ""})
         self.invalidate_cache(dst)
 
+    def mv(
+        self,
+        path1: str,
+        path2: str,
+        recursive: bool = False,
+        maxdepth: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Rename via the iRODS catalog instead of fsspec's server-side copy + delete.
+
+        A catalog rename is a metadata operation regardless of object size, which is what
+        DuckDB's temp->target rename of a multi-gigabyte COPY TO output needs. Falls back
+        to fsspec's copy+rm for the cases a rename cannot express: bounded-depth moves,
+        and a collection moved onto an existing destination (iRODS would move *into* it,
+        which differs from fsspec's merge semantics).
+        """
+        src = self._strip_protocol(path1)
+        dst = self._strip_protocol(path2)
+        if src == dst:
+            return
+        if maxdepth is not None:
+            super().mv(path1, path2, recursive=recursive, maxdepth=maxdepth, **kwargs)
+            return
+        try:
+            dst_type: str | None = self.info(dst)["type"]
+        except FileNotFoundError:
+            dst_type = None
+        if self.info(src)["type"] == "directory":
+            if not recursive or dst_type is not None:
+                super().mv(path1, path2, recursive=recursive, **kwargs)
+                return
+            with self._lock, _translate_errors(f"{src} -> {dst}"):
+                self.session.collections.move(src, dst)
+            self._invalidate_subtree(src)
+            self.invalidate_cache(dst)
+        elif dst_type == "directory":
+            # Moving a file onto an existing collection: defer to fsspec's semantics
+            # rather than guessing between replace and move-into.
+            super().mv(path1, path2, recursive=recursive, **kwargs)
+        else:
+            self._move_file(src, dst)
+
+    def _move_file(self, src: str, dst: str) -> None:
+        """Rename one data object, clobbering an existing destination (see `cp_file`).
+
+        iRODS refuses to rename onto an existing data object, so the destination is
+        unlinked first. Not atomic: a crash between the unlink and the move loses the old
+        destination, but never the source data.
+        """
+        self.rm_file(dst)
+        with self._lock, _translate_errors(f"{src} -> {dst}"):
+            self.session.data_objects.move(src, dst)
+        self.invalidate_cache(src)
+        self.invalidate_cache(dst)
+
     def put_file(
         self,
         lpath: str,
@@ -489,6 +577,8 @@ class DucktapeFileSystem(AbstractFileSystem):
     ) -> None:
         """Upload a whole local file using PRC parallel transfer (see `get_file`)."""
         norm = self._strip_protocol(rpath)
+        if mode == "create" and self.exists(norm):
+            raise FileExistsError(norm)
         if os.path.isdir(lpath):
             self.makedirs(norm, exist_ok=True)
             return

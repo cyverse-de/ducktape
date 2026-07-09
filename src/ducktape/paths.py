@@ -70,6 +70,14 @@ def normalize_irods_path(raw: str | None) -> str:
     return "/" + "/".join(segments)
 
 
+def is_under(name: str, root: str) -> bool:
+    """True if `name` is `root` itself or a descendant path of `root`."""
+    if name == root:
+        return True
+    prefix = root if root.endswith("/") else root + "/"
+    return name.startswith(prefix)
+
+
 def parent_path(path: str) -> str:
     """Return the parent collection of an iRODS logical path (`/` for the root)."""
     normalized = normalize_irods_path(path)

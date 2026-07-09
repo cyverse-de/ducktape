@@ -73,6 +73,28 @@ def test_resolve_auth_explicit_missing_fields(storage_options: dict[str, str]) -
         resolve_auth(storage_options, env={})
 
 
+_EXPLICIT = {
+    "host": "irods.example.org",
+    "user": "rods",
+    "password": "secret",
+    "zone": "tempZone",
+}
+
+
+@pytest.mark.parametrize(
+    ("port", "expected"),
+    [("1247", 1247), (1247, 1247), ("abc", None), (0, None), (65536, None), (-1, None)],
+    ids=["string-ok", "int-ok", "non-numeric", "zero", "too-high", "negative"],
+)
+def test_resolve_auth_validates_port(port: object, expected: int | None) -> None:
+    options = {**_EXPLICIT, "port": port}
+    if expected is None:
+        with pytest.raises(IrodsAuthError):
+            resolve_auth(options, env={})
+    else:
+        assert resolve_auth(options, env={}).port == expected
+
+
 def test_password_absent_from_repr() -> None:
     config = resolve_auth(
         {

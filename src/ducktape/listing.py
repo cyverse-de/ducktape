@@ -18,7 +18,7 @@ from irods.column import Like
 from irods.models import Collection, DataObject
 
 from .errors import IrodsFileNotFoundError
-from .paths import ROOT, base_name, parent_path
+from .paths import ROOT, base_name, is_under, parent_path
 
 if TYPE_CHECKING:
     from irods.session import iRODSSession
@@ -187,14 +187,6 @@ def stat(session: iRODSSession, path: str) -> InfoDict:
     raise IrodsFileNotFoundError(path)
 
 
-def _is_under(name: str, root: str) -> bool:
-    """True if `name` is `root` itself or a descendant path of `root`."""
-    if name == root:
-        return True
-    prefix = root if root.endswith("/") else root + "/"
-    return name.startswith(prefix)
-
-
 def _descendant_pattern(root: str) -> str:
     """GenQuery LIKE pattern for collections strictly below `root` (excludes `root`)."""
     prefix = "" if root == ROOT else root
@@ -211,7 +203,7 @@ def _subtree_data_object_rows(
 ) -> Iterator[dict[str, Any]]:
     # iRODS LIKE treats `_`/`%` as wildcards, so `root + "%"` can over-match siblings (and
     # `_` is common in names). That is harmless here: the pattern always matches a *superset*
-    # of root and its descendants, and the `_is_under` post-filter trims it to the exact set.
+    # of root and its descendants, and the `is_under` post-filter trims it to the exact set.
     # `%` after `root` (not `/%`) keeps files directly in `root` in the same single query.
     query = session.query(
         Collection.name,
@@ -222,7 +214,7 @@ def _subtree_data_object_rows(
     ).filter(Like(Collection.name, _subtree_pattern(root)))
     for row in query.get_results():
         collection = row[Collection.name]
-        if not _is_under(collection, root):
+        if not is_under(collection, root):
             continue
         yield {
             "collection": collection,
@@ -256,7 +248,7 @@ def walk_collections(session: iRODSSession, root: str) -> list[InfoDict]:
     infos = []
     for row in query.get_results():
         name = row[Collection.name]
-        if name == root or not _is_under(name, root):
+        if name == root or not is_under(name, root):
             continue
         infos.append(
             dir_info(

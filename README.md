@@ -16,7 +16,12 @@ Supported operations: listing (`ls`/`info`/`exists`), recursive listing (`find`/
 `glob`, which fetch a whole subtree in a constant number of catalog queries), reading (range
 reads + whole-file parallel `get`), writing (streaming `open("wb")` + whole-file parallel
 `put`, both driving fsspec progress callbacks), `mkdir`/`makedirs`/`rmdir`, idempotent `rm`,
-and server-side `copy`. Append mode is not supported.
+server-side `copy`, and `mv` as a native catalog rename (constant-time regardless of object
+size; a move onto an existing object replaces it). Transactional writes are supported:
+inside `with fs.transaction:`, writes stream to a hidden `.{name}.ducktape-tmp-*` staging
+object in the same collection and are renamed over the target on commit (or unlinked on
+rollback); a crash between close and commit can leave such an orphan behind. Append mode is
+not supported.
 
 ## Paths
 

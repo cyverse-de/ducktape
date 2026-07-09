@@ -110,6 +110,68 @@ def test_cp_file_overwrites_existing(
         assert cast(bytes, handle.read()) == b"fresh"
 
 
+def test_mv_file(fs: DucktapeFileSystem, work_collection: str) -> None:
+    src = f"{work_collection}/mv-src.bin"
+    dst = f"{work_collection}/mv-dst.bin"
+    payload = b"move me"
+    _write_object(fs, src, payload)
+    fs.mv(src, dst)
+    assert not fs.exists(src)
+    with fs.open(dst, "rb") as handle:
+        assert cast(bytes, handle.read()) == payload
+
+
+def test_mv_file_overwrites_existing(
+    fs: DucktapeFileSystem, work_collection: str
+) -> None:
+    src = f"{work_collection}/mv-src.bin"
+    dst = f"{work_collection}/mv-dst.bin"
+    _write_object(fs, dst, b"stale")
+    _write_object(fs, src, b"fresh")
+    # mirrors DuckDB's temp->target rename: the move must clobber an existing dst.
+    fs.mv(src, dst)
+    assert not fs.exists(src)
+    with fs.open(dst, "rb") as handle:
+        assert cast(bytes, handle.read()) == b"fresh"
+
+
+def test_mv_collection(fs: DucktapeFileSystem, work_collection: str) -> None:
+    src = f"{work_collection}/mv-dir"
+    dst = f"{work_collection}/mv-dir-renamed"
+    fs.mkdir(src)
+    _write_object(fs, f"{src}/inner.bin", b"inner")
+    fs.mv(src, dst, recursive=True)
+    assert not fs.exists(src)
+    with fs.open(f"{dst}/inner.bin", "rb") as handle:
+        assert cast(bytes, handle.read()) == b"inner"
+
+
+def test_transaction_commit_publishes(
+    fs: DucktapeFileSystem, work_collection: str
+) -> None:
+    path = f"{work_collection}/txn.bin"
+    with fs.transaction:
+        _write_object(fs, path, b"committed")
+        # Inside the transaction the final object must not exist yet.
+        assert not fs.exists(path)
+    with fs.open(path, "rb") as handle:
+        assert cast(bytes, handle.read()) == b"committed"
+
+
+def test_transaction_rollback_leaves_nothing(
+    fs: DucktapeFileSystem, work_collection: str
+) -> None:
+    path = f"{work_collection}/txn-rollback.bin"
+    with pytest.raises(RuntimeError):
+        with fs.transaction:
+            _write_object(fs, path, b"never published")
+            raise RuntimeError("abort")
+    fs.invalidate_cache()
+    assert not fs.exists(path)
+    leftovers = [name for name in fs.ls(work_collection, detail=False) if "txn" in name]
+    assert leftovers == []  # no staging orphan either
+
+
 def test_put_file_parallel(
     fs: DucktapeFileSystem, work_collection: str, tmp_path: object
 ) -> None:

@@ -5,9 +5,10 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
-from irods.exception import HIERARCHY_ERROR
+from irods.exception import HIERARCHY_ERROR, NetworkException
 
 from ducktape import listing
+from ducktape.errors import IrodsFileNotFoundError, IrodsOperationError
 from ducktape.file import DucktapeBufferedFile
 from ducktape.filesystem import DucktapeFileSystem
 
@@ -74,6 +75,62 @@ def test_ls_directory_uses_children_and_caches(
     names = fs.ls("/tempZone/home/rods", detail=False)
     assert names == ["/tempZone/home/rods/a", "/tempZone/home/rods/sub"]
     assert calls["count"] == 1  # second ls served from dircache
+
+
+def test_info_maps_network_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    fs = make_fs()
+
+    def raise_network(session: object, path: str) -> dict:
+        raise NetworkException("connection lost")
+
+    monkeypatch.setattr(listing, "stat", raise_network)
+    with pytest.raises(IrodsOperationError):
+        fs.info("/tempZone/home/rods/x")
+
+
+def test_ls_maps_network_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    fs = make_fs()
+    monkeypatch.setattr(
+        listing,
+        "stat",
+        lambda session, path: {"name": path, "type": "directory", "size": 0},
+    )
+
+    def raise_network(session: object, path: str, page_size: int | None) -> list:
+        raise NetworkException("connection lost")
+
+    monkeypatch.setattr(listing, "list_collection_children", raise_network)
+    with pytest.raises(IrodsOperationError):
+        fs.ls("/tempZone/home/rods")
+
+
+def test_exists_false_only_for_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A network failure must raise, not read as "does not exist"."""
+    fs = make_fs()
+
+    def raise_missing(session: object, path: str) -> dict:
+        raise IrodsFileNotFoundError(path)
+
+    monkeypatch.setattr(listing, "stat", raise_missing)
+    assert fs.exists("/tempZone/home/rods/missing") is False
+
+    def raise_network(session: object, path: str) -> dict:
+        raise NetworkException("connection lost")
+
+    monkeypatch.setattr(listing, "stat", raise_network)
+    with pytest.raises(IrodsOperationError):
+        fs.exists("/tempZone/home/rods/x")
+
+
+def test_open_directory_for_read_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    fs = make_fs()
+    monkeypatch.setattr(
+        listing,
+        "stat",
+        lambda session, path: {"name": path, "type": "directory", "size": 0},
+    )
+    with pytest.raises(IsADirectoryError):
+        fs.open("/tempZone/home/rods/sub", "rb")
 
 
 def test_ls_on_file_returns_single_entry(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -258,12 +315,13 @@ def test_open_retries_on_hierarchy_error() -> None:
     assert session.data_objects.open_attempts == 3  # 2 failures + 1 success
 
 
-def test_open_retries_exhausted_reraises() -> None:
+def test_open_retries_exhausted_maps_operation_error() -> None:
     session = FlakySession(FakeHandle(b"abc"), fail_times=5)
     fs = make_retry_fs(session, retries=3)
     f = DucktapeBufferedFile(fs, "/z/x", mode="rb", size=3)
-    with pytest.raises(HIERARCHY_ERROR):
+    with pytest.raises(IrodsOperationError) as excinfo:
         f._fetch_range(0, 3)
+    assert isinstance(excinfo.value.__cause__, HIERARCHY_ERROR)
     assert session.data_objects.open_attempts == 4  # initial try + 3 retries
 
 
@@ -271,7 +329,7 @@ def test_open_retry_disabled() -> None:
     session = FlakySession(FakeHandle(b"abc"), fail_times=1)
     fs = make_retry_fs(session, retries=0)
     f = DucktapeBufferedFile(fs, "/z/x", mode="rb", size=3)
-    with pytest.raises(HIERARCHY_ERROR):
+    with pytest.raises(IrodsOperationError):
         f._fetch_range(0, 3)
     assert session.data_objects.open_attempts == 1  # no retry
 
